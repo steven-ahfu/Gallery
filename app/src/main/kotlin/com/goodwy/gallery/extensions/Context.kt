@@ -543,6 +543,7 @@ fun Context.loadImage(
     roundCorners: Int,
     signature: ObjectKey,
     skipMemoryCacheAtPaths: ArrayList<String>? = null,
+    loadHighPriority: Boolean = false,
     onError: (() -> Unit)? = null
 ) {
     target.isHorizontalScrolling = horizontalScroll
@@ -564,6 +565,7 @@ fun Context.loadImage(
             skipMemoryCacheAtPaths = skipMemoryCacheAtPaths,
             animate = animateGifs,
             tryLoadingWithPicasso = type == TYPE_IMAGES && path.isPng(),
+            loadHighPriority = loadHighPriority,
             onError = onError
         )
     }
@@ -613,12 +615,13 @@ fun Context.loadImageBase(
     animate: Boolean = false,
     tryLoadingWithPicasso: Boolean = false,
     crossFadeDuration: Int = THUMBNAIL_FADE_DURATION_MS,
+    loadHighPriority: Boolean = false,
     onError: (() -> Unit)? = null
 ) {
     val options = RequestOptions()
         .signature(signature)
         .skipMemoryCache(skipMemoryCacheAtPaths?.contains(path) == true)
-        .priority(Priority.LOW)
+        .priority(if (loadHighPriority) Priority.HIGH else Priority.LOW)
         .diskCacheStrategy(DiskCacheStrategy.RESOURCE)
         .format(DecodeFormat.PREFER_ARGB_8888)
 

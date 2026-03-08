@@ -106,7 +106,7 @@ class MediaAdapter(
         val allowLongPress = (!isAGetIntent || allowMultiplePicks) && tmbItem is Medium
         holder.bindView(tmbItem, tmbItem is Medium, allowLongPress) { itemView, adapterPosition ->
             if (tmbItem is Medium) {
-                setupThumbnail(itemView, tmbItem)
+                setupThumbnail(itemView, tmbItem, position)
             } else {
                 setupSection(itemView, tmbItem as ThumbnailSection, position)
             }
@@ -625,7 +625,7 @@ class MediaAdapter(
         notifyDataSetChanged()
     }
 
-    private fun setupThumbnail(view: View, medium: Medium) {
+    private fun setupThumbnail(view: View, medium: Medium, position: Int) {
         val isSelected = selectedKeys.contains(medium.path.hashCode())
         bindItem(view, medium).apply {
             val padding = if (config.thumbnailSpacing <= 1) {
@@ -720,6 +720,7 @@ class MediaAdapter(
                 roundCorners = roundedCorners,
                 signature = medium.getKey(),
                 skipMemoryCacheAtPaths = rotatedImagePaths,
+                loadHighPriority = position < 60,
                 onError = {
                     mediumThumbnail.scaleType = ImageView.ScaleType.CENTER
                     mediumThumbnail.setImageDrawable(AppCompatResources.getDrawable(activity, R.drawable.ic_vector_warning_colored))
