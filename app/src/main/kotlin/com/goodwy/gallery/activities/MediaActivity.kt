@@ -56,6 +56,7 @@ class MediaActivity : SimpleActivity(), MediaOperationsListener {
     private var mIsGetVideoIntent = false
     private var mIsGetAnyIntent = false
     private var mIsGettingMedia = false
+    private var mediaRequestId = 0L
     private var mAllowPickingMultiple = false
     private var mShowAll = false
     private var mLoadedInitialPhotos = false
@@ -773,7 +774,7 @@ class MediaActivity : SimpleActivity(), MediaOperationsListener {
                         binding.mediaRefreshLayout.isRefreshing = true
                     }
                 } else {
-                    gotMedia(it, true)
+                    gotMedia(it, true, null)
                 }
                 startAsyncTask()
             }
@@ -783,6 +784,7 @@ class MediaActivity : SimpleActivity(), MediaOperationsListener {
     }
 
     private fun startAsyncTask() {
+        val requestId = ++mediaRequestId
         mCurrAsyncTask?.stopFetching()
         mCurrAsyncTask = GetMediaAsynctask(
             context = applicationContext,
@@ -792,10 +794,16 @@ class MediaActivity : SimpleActivity(), MediaOperationsListener {
             showAll = mShowAll
         ) {
             ensureBackgroundThread {
+                if (requestId != mediaRequestId) {
+                    return@ensureBackgroundThread
+                }
+
                 val oldMedia = mMedia.clone() as ArrayList<ThumbnailItem>
                 val newMedia = it
                 try {
-                    gotMedia(newMedia, false)
+                    if (requestId == mediaRequestId) {
+                        gotMedia(newMedia, false, requestId)
+                    }
 
                     // remove cached files that are no longer valid for whatever reason
                     val newPaths = newMedia.mapNotNull { it as? Medium }.map { it.path }
@@ -811,6 +819,9 @@ class MediaActivity : SimpleActivity(), MediaOperationsListener {
                             }
                         }
                 } catch (_: Exception) {
+                    if (requestId == mediaRequestId) {
+                        mIsGettingMedia = false
+                    }
                 }
             }
         }
@@ -1095,8 +1106,14 @@ class MediaActivity : SimpleActivity(), MediaOperationsListener {
         }
     }
 
-    private fun gotMedia(media: ArrayList<ThumbnailItem>, isFromCache: Boolean) {
-        mIsGettingMedia = false
+    private fun gotMedia(media: ArrayList<ThumbnailItem>, isFromCache: Boolean, requestId: Long?) {
+        if (requestId != null) {
+            if (requestId != mediaRequestId) {
+                return
+            }
+            mIsGettingMedia = false
+        }
+
         checkLastMediaChanged()
         mMedia = media
 
