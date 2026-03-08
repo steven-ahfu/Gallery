@@ -138,6 +138,7 @@ class MediaActivity : SimpleActivity(), MediaOperationsListener {
         }
 
         updateWidgets()
+        maybeRunMediaDbMaintenance()
         setupTabs()
     }
 

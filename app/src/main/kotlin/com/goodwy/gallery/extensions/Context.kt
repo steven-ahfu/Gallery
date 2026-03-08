@@ -13,8 +13,10 @@ import android.graphics.drawable.PictureDrawable
 import android.media.AudioManager
 import android.net.Uri
 import android.os.Process
+import android.os.SystemClock
 import android.provider.MediaStore.Files
 import android.provider.MediaStore.Images
+import android.util.Log
 import android.widget.ImageView
 import androidx.core.net.toUri
 import androidx.documentfile.provider.DocumentFile
@@ -56,6 +58,78 @@ import kotlin.math.max
 import kotlin.math.min
 
 val Context.audioManager get() = getSystemService(Context.AUDIO_SERVICE) as AudioManager
+
+private const val MEDIA_DB_MAINTENANCE_LOG_TAG = "MediaDbMaintenance"
+private const val MEDIA_DB_MAINTENANCE_INTERVAL_MS = 6 * 60 * 60 * 1000L
+private const val MEDIA_DB_MAINTENANCE_MAX_DURATION_MS = 250L
+private const val MEDIA_DB_MAINTENANCE_BATCH_SIZE = 100
+
+fun Context.maybeRunMediaDbMaintenance(force: Boolean = false) {
+    val now = System.currentTimeMillis()
+    val elapsedSinceLastRun = now - config.lastMediaDbMaintenance
+    if (!force && elapsedSinceLastRun in 0 until MEDIA_DB_MAINTENANCE_INTERVAL_MS) {
+        return
+    }
+
+    config.lastMediaDbMaintenance = now
+    Thread { runMediaDbMaintenance() }.start()
+}
+
+private fun Context.runMediaDbMaintenance(maxDurationMs: Long = MEDIA_DB_MAINTENANCE_MAX_DURATION_MS) {
+    try {
+        val startTs = SystemClock.elapsedRealtime()
+        val beforeTotal = mediaDB.getTotalRowCount()
+        val beforeByFolder = mediaDB.getRowCountByFolder()
+
+        var deletedRows = 0
+        var deletedFavoriteRows = 0
+        var lastId = 0L
+        val otgPath = config.OTGPath
+
+        while (SystemClock.elapsedRealtime() - startTs < maxDurationMs) {
+            val candidates = mediaDB.getCleanupCandidates(lastId, MEDIA_DB_MAINTENANCE_BATCH_SIZE)
+            if (candidates.isEmpty()) {
+                break
+            }
+
+            lastId = candidates.last().id
+            val staleCandidates = candidates.filter { candidate ->
+                val dbPath = candidate.path
+                val pathToCheck = if (candidate.deletedTS != 0L && dbPath.startsWith(RECYCLE_BIN)) {
+                    File(recycleBinPath, dbPath.removePrefix(RECYCLE_BIN)).toString()
+                } else {
+                    dbPath
+                }
+
+                !getDoesFilePathExist(pathToCheck, otgPath)
+            }
+
+            if (staleCandidates.isEmpty()) {
+                continue
+            }
+
+            val staleIds = staleCandidates.map { it.id }
+            deletedRows += mediaDB.deleteByIds(staleIds)
+
+            staleCandidates.filter { it.isFavorite && it.deletedTS == 0L }.forEach { staleCandidate ->
+                favoritesDB.deleteFavoritePath(staleCandidate.path)
+                deletedFavoriteRows++
+            }
+        }
+
+        val afterTotal = mediaDB.getTotalRowCount()
+        val afterByFolder = mediaDB.getRowCountByFolder()
+        val beforeFolderSummary = beforeByFolder.sortedByDescending { it.rowCount }.take(5).joinToString { "${it.parentPath}:${it.rowCount}" }
+        val afterFolderSummary = afterByFolder.sortedByDescending { it.rowCount }.take(5).joinToString { "${it.parentPath}:${it.rowCount}" }
+
+        Log.i(
+            MEDIA_DB_MAINTENANCE_LOG_TAG,
+            "DB maintenance before=$beforeTotal after=$afterTotal deleted=$deletedRows deletedFavorites=$deletedFavoriteRows beforeFolders=${beforeByFolder.size}[$beforeFolderSummary] afterFolders=${afterByFolder.size}[$afterFolderSummary]"
+        )
+    } catch (e: Exception) {
+        Log.w(MEDIA_DB_MAINTENANCE_LOG_TAG, "Failed to run media DB maintenance", e)
+    }
+}
 
 fun Context.getHumanizedFilename(path: String): String {
     val humanized = humanizePath(path)
