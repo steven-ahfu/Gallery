@@ -542,6 +542,7 @@ fun Context.loadImage(
     cropThumbnails: Boolean,
     roundCorners: Int,
     signature: ObjectKey,
+    highPriority: Boolean = false,
     skipMemoryCacheAtPaths: ArrayList<String>? = null,
     onError: (() -> Unit)? = null
 ) {
@@ -561,6 +562,7 @@ fun Context.loadImage(
             cropThumbnails = cropThumbnails,
             roundCorners = roundCorners,
             signature = signature,
+            highPriority = highPriority,
             skipMemoryCacheAtPaths = skipMemoryCacheAtPaths,
             animate = animateGifs,
             tryLoadingWithPicasso = type == TYPE_IMAGES && path.isPng(),
@@ -609,6 +611,7 @@ fun Context.loadImageBase(
     cropThumbnails: Boolean,
     roundCorners: Int,
     signature: ObjectKey,
+    highPriority: Boolean = false,
     skipMemoryCacheAtPaths: ArrayList<String>? = null,
     animate: Boolean = false,
     tryLoadingWithPicasso: Boolean = false,
@@ -618,7 +621,7 @@ fun Context.loadImageBase(
     val options = RequestOptions()
         .signature(signature)
         .skipMemoryCache(skipMemoryCacheAtPaths?.contains(path) == true)
-        .priority(Priority.LOW)
+        .priority(if (highPriority) Priority.HIGH else Priority.NORMAL)
         .diskCacheStrategy(DiskCacheStrategy.RESOURCE)
         .format(DecodeFormat.PREFER_ARGB_8888)
 
@@ -691,6 +694,55 @@ fun Context.loadImageBase(
     })
 
     builder.into(target)
+}
+
+fun Context.preloadImageBase(
+    path: String,
+    cropThumbnails: Boolean,
+    roundCorners: Int,
+    signature: ObjectKey,
+    highPriority: Boolean = false,
+    skipMemoryCache: Boolean = false,
+): Target<Drawable> {
+    val options = RequestOptions()
+        .signature(signature)
+        .skipMemoryCache(skipMemoryCache)
+        .priority(if (highPriority) Priority.HIGH else Priority.NORMAL)
+        .diskCacheStrategy(DiskCacheStrategy.RESOURCE)
+        .format(DecodeFormat.PREFER_ARGB_8888)
+
+    if (cropThumbnails) {
+        options.optionalTransform(CenterCrop())
+        options.optionalTransform(
+            WebpDrawable::class.java,
+            WebpDrawableTransformation(CenterCrop())
+        )
+    } else {
+        options.optionalTransform(FitCenter())
+        options.optionalTransform(WebpDrawable::class.java, WebpDrawableTransformation(FitCenter()))
+    }
+
+    if (roundCorners != ROUNDED_CORNERS_NONE) {
+        val cornerSize =
+            if (roundCorners == ROUNDED_CORNERS_SMALL) com.goodwy.commons.R.dimen.rounded_corner_radius_big else com.goodwy.commons.R.dimen.dialog_corner_radius
+        val cornerRadius = resources.getDimension(cornerSize).toInt()
+        val roundedCornersTransform = RoundedCorners(cornerRadius)
+        options.optionalTransform(MultiTransformation(CenterCrop(), roundedCornersTransform))
+        options.optionalTransform(
+            WebpDrawable::class.java,
+            MultiTransformation(
+                WebpDrawableTransformation(CenterCrop()),
+                WebpDrawableTransformation(roundedCornersTransform)
+            )
+        )
+    }
+
+    WebpBitmapFactory.sUseSystemDecoder = false // CVE-2023-4863
+    return Glide.with(applicationContext)
+        .load(path)
+        .apply(options)
+        .set(WebpDownsampler.USE_SYSTEM_DECODER, false) // CVE-2023-4863
+        .preload()
 }
 
 fun Context.loadSVG(
