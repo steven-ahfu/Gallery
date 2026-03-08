@@ -2,10 +2,13 @@ package com.goodwy.gallery.asynctasks
 
 import android.content.Context
 import android.os.AsyncTask
+import android.util.Log
 import com.goodwy.commons.helpers.FAVORITES
 import com.goodwy.commons.helpers.SORT_BY_DATE_MODIFIED
 import com.goodwy.commons.helpers.SORT_BY_DATE_TAKEN
 import com.goodwy.commons.helpers.SORT_BY_SIZE
+import com.goodwy.commons.helpers.isExternalStorageManager
+import com.goodwy.commons.helpers.isRPlus
 import com.goodwy.gallery.extensions.config
 import com.goodwy.gallery.extensions.getFavoritePaths
 import com.goodwy.gallery.helpers.*
@@ -17,6 +20,10 @@ class GetMediaAsynctask(
     val showAll: Boolean, val callback: (media: ArrayList<ThumbnailItem>) -> Unit
 ) :
     AsyncTask<Void, Void, ArrayList<ThumbnailItem>>() {
+    companion object {
+        private const val TAG = "GetMediaAsynctask"
+    }
+
     private val mediaFetcher = MediaFetcher(context)
 
     override fun doInBackground(vararg params: Void): ArrayList<ThumbnailItem> {
@@ -42,10 +49,32 @@ class GetMediaAsynctask(
         val media = if (showAll) {
             val foldersToScan = mediaFetcher.getFoldersToScan().filter { it != RECYCLE_BIN && it != FAVORITES && !context.config.isFolderProtected(it) }
             val media = ArrayList<Medium>()
+
+            val shouldPrefetchAndroid11Files = isRPlus() && !isExternalStorageManager()
+            var android11QueryCount = 0
+            val prefetchedAndroid11Files = if (shouldPrefetchAndroid11Files) {
+                android11QueryCount++
+                val queryStartedAt = System.currentTimeMillis()
+                Log.d(TAG, "showAll refresh: getAndroid11FolderMedia query #$android11QueryCount started at $queryStartedAt")
+                mediaFetcher.getAndroid11FolderMedia(
+                    isPickImage,
+                    isPickVideo,
+                    favoritePaths,
+                    false,
+                    getProperDateTaken,
+                    dateTakens.clone() as HashMap<String, Long>
+                ).also {
+                    val queryFinishedAt = System.currentTimeMillis()
+                    Log.d(TAG, "showAll refresh: getAndroid11FolderMedia query #$android11QueryCount finished at $queryFinishedAt (duration=${queryFinishedAt - queryStartedAt}ms)")
+                }
+            } else {
+                null
+            }
+
             foldersToScan.forEach {
                 val newMedia = mediaFetcher.getFilesFrom(
                     it, isPickImage, isPickVideo, getProperDateTaken, getProperLastModified, getProperFileSize,
-                    favoritePaths, getVideoDurations, lastModifieds, dateTakens.clone() as HashMap<String, Long>, null
+                    favoritePaths, getVideoDurations, lastModifieds, dateTakens.clone() as HashMap<String, Long>, prefetchedAndroid11Files
                 )
                 media.addAll(newMedia)
             }
