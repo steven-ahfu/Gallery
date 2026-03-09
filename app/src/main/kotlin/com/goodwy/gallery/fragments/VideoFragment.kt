@@ -61,6 +61,8 @@ import com.goodwy.gallery.views.MediaSideScroll
 import java.io.File
 import java.io.FileInputStream
 import java.text.DecimalFormat
+import androidx.core.net.toUri
+import kotlin.math.max
 
 @UnstableApi
 class VideoFragment : ViewPagerFragment(), TextureView.SurfaceTextureListener,
@@ -111,6 +113,7 @@ class VideoFragment : ViewPagerFragment(), TextureView.SurfaceTextureListener,
     private var mVolumeController: VolumeController? = null
     private var mMuteInit: Boolean = false
 
+    @SuppressLint("ClickableViewAccessibility")
     override fun onCreateView(
         inflater: LayoutInflater,
         container: ViewGroup?,
@@ -329,11 +332,22 @@ class VideoFragment : ViewPagerFragment(), TextureView.SurfaceTextureListener,
             val textColor = this.requireContext().getProperTextColor()
             arrayListOf(
                 binding.bottomVideoTimeHolder.videoDuration,
-                binding.bottomVideoTimeHolder.videoCurrTime
+                binding.bottomVideoTimeHolder.videoCurrTime,
+                binding.bottomVideoTimeHolder.videoPlaybackSpeed
             ).forEach {
                 it.apply {
                     setTextColor(textColor)
                     setShadowLayer(2f, 0f, 0f, textColor.getContrastColor())
+                }
+            }
+            arrayListOf(
+                binding.bottomVideoTimeHolder.videoPrevFile,
+                binding.bottomVideoTimeHolder.videoTogglePlayPause,
+                binding.bottomVideoTimeHolder.videoNextFile,
+                binding.bottomVideoTimeHolder.videoToggleMute
+            ).forEach {
+                it.apply {
+                    setColorFilter(textColor)
                 }
             }
         }
@@ -352,6 +366,10 @@ class VideoFragment : ViewPagerFragment(), TextureView.SurfaceTextureListener,
         super.onDestroy()
         if (activity?.isChangingConfigurations == false) {
             cleanup()
+        }
+
+        if (::mVolumeSideScroll.isInitialized) {
+            mVolumeSideScroll.cleanup()
         }
     }
 
@@ -439,7 +457,7 @@ class VideoFragment : ViewPagerFragment(), TextureView.SurfaceTextureListener,
         }
 
         val isContentUri = mMedium.path.startsWith("content://")
-        val uri = if (isContentUri) Uri.parse(mMedium.path) else Uri.fromFile(File(mMedium.path))
+        val uri = if (isContentUri) mMedium.path.toUri() else Uri.fromFile(File(mMedium.path))
         val dataSpec = DataSpec(uri)
         val fileDataSource = if (isContentUri) {
             ContentDataSource(requireContext())
@@ -611,8 +629,8 @@ class VideoFragment : ViewPagerFragment(), TextureView.SurfaceTextureListener,
                     mIsPanorama = true
                 }
             }
-        } catch (ignored: Exception) {
-        } catch (ignored: OutOfMemoryError) {
+        } catch (_: Exception) {
+        } catch (_: OutOfMemoryError) {
         }
     }
 
@@ -702,7 +720,16 @@ class VideoFragment : ViewPagerFragment(), TextureView.SurfaceTextureListener,
         val curr = mExoPlayer!!.currentPosition
         var newPosition =
             if (forward) curr + FAST_FORWARD_VIDEO_MS else curr - FAST_FORWARD_VIDEO_MS
-        newPosition = newPosition.coerceIn(0, mExoPlayer!!.duration)
+
+        // Fix: Exception java.lang.IllegalArgumentException: Cannot coerce value to an empty range: maximum -9223372036854775807 is less than minimum 0.
+        val duration = mExoPlayer!!.duration
+        newPosition = if (duration > 0) {
+            newPosition.coerceIn(0, duration)
+        } else {
+            // If the duration is unknown, we limit only from below
+            max(0, newPosition)
+        }
+
         setPosition(newPosition)
         if (!mIsPlaying) {
             togglePlayPause()

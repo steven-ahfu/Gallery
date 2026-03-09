@@ -8,6 +8,7 @@ import android.graphics.Bitmap
 import android.graphics.Color
 import android.os.Bundle
 import android.os.Handler
+import android.speech.RecognizerIntent
 import android.view.View
 import android.view.ViewGroup
 import android.widget.RelativeLayout
@@ -44,6 +45,8 @@ import com.goodwy.gallery.models.ThumbnailItem
 import com.goodwy.gallery.models.ThumbnailSection
 import java.io.File
 import java.io.IOException
+import java.util.Objects
+import kotlin.math.abs
 
 class MediaActivity : SimpleActivity(), MediaOperationsListener {
     private val LAST_MEDIA_CHECK_PERIOD = 3000L
@@ -76,6 +79,7 @@ class MediaActivity : SimpleActivity(), MediaOperationsListener {
     private var mStoredPrimaryColor = 0
     private var mStoredThumbnailSpacing = 0
     private var mStoredHideTopBarWhenScroll = false
+    private var isSpeechToTextAvailable = false
 
     private val binding by viewBinding(ActivityMediaBinding::inflate)
 
@@ -115,7 +119,14 @@ class MediaActivity : SimpleActivity(), MediaOperationsListener {
             useTransparentNavigation = false, //!config.scrollHorizontally,
             useTopSearchMenu = true
         )
-        if (config.changeColourTopBar) setupSearchMenuScrollListener(binding.mediaGrid, binding.mediaMenu)
+        if (config.changeColourTopBar) {
+            val useSurfaceColor = isDynamicTheme() && !isSystemInDarkMode()
+            setupSearchMenuScrollListener(
+                scrollingView = binding.mediaGrid,
+                searchMenu = binding.mediaMenu,
+                surfaceColor = useSurfaceColor
+            )
+        }
 
 
         if (mShowAll) {
@@ -127,6 +138,7 @@ class MediaActivity : SimpleActivity(), MediaOperationsListener {
         }
 
         updateWidgets()
+        maybeRunMediaDbMaintenance()
         setupTabs()
     }
 
@@ -140,8 +152,9 @@ class MediaActivity : SimpleActivity(), MediaOperationsListener {
                     binding.mainTopTabsContainer.setPadding(0, 0, 0, bottomNavigationBarSize)
                 } else {
                     val bottomBarSize = resources.getDimension(R.dimen.bottom_actions_height).toInt()
+                    val mediumMargin = resources.getDimension(com.goodwy.commons.R.dimen.medium_margin).toInt()
                     binding.mediaFastscroller.trackMarginEnd = bottomNavigationBarSize + bottomBarSize
-                    binding.mediaGrid.setPadding(0, 0, 0, bottomNavigationBarSize + bottomBarSize) // needed clipToPadding="false"
+                    binding.mediaGrid.setPadding(0, 0, 0, bottomNavigationBarSize + bottomBarSize + mediumMargin) // needed clipToPadding="false"
                 }
                 //updateNavigationBarColor(getProperBackgroundColor())
             }
@@ -158,7 +171,7 @@ class MediaActivity : SimpleActivity(), MediaOperationsListener {
         updateMenuColors()
         setupTabsColor()
 
-        if (config.tabsChanged || mStoredHideTopBarWhenScroll != config.hideTopBarWhenScroll) {
+        if (config.needRestart || mStoredHideTopBarWhenScroll != config.hideTopBarWhenScroll) {
             finish()
             startActivity(intent)
             return
@@ -203,9 +216,14 @@ class MediaActivity : SimpleActivity(), MediaOperationsListener {
             setupAdapter()
         }
 
+        if (isDynamicTheme() && !isSystemInDarkMode()) {
+            binding.mediaGrid.setBackgroundColor(getSurfaceColor())
+        }
+
         refreshMenuItems()
 
-        binding.mediaFastscroller.updateColors(primaryColor)
+        val accentColor = getProperAccentColor()
+        binding.mediaFastscroller.updateColors(accentColor)
         binding.mediaRefreshLayout.isEnabled = config.enablePullToRefresh
         getMediaAdapter()?.apply {
             dateFormat = config.dateFormat
@@ -294,6 +312,16 @@ class MediaActivity : SimpleActivity(), MediaOperationsListener {
                 mMedia.clear()
                 refreshItems()
             }
+        } else if (requestCode == REQUEST_CODE_SPEECH_INPUT && resultCode == RESULT_OK) {
+            if (resultData != null) {
+                val res: ArrayList<String> =
+                    resultData.getStringArrayListExtra(RecognizerIntent.EXTRA_RESULTS) as ArrayList<String>
+
+                val speechToText =  Objects.requireNonNull(res)[0]
+                if (speechToText.isNotEmpty()) {
+                    binding.mediaMenu.setText(speechToText)
+                }
+            }
         }
         super.onActivityResult(requestCode, resultCode, resultData)
     }
@@ -338,8 +366,18 @@ class MediaActivity : SimpleActivity(), MediaOperationsListener {
                 super.onBackPressed()
             }
         }
+
+        if (baseConfig.useSpeechToText) {
+            isSpeechToTextAvailable = isSpeechToTextAvailable()
+            binding.mediaMenu.showSpeechToText = isSpeechToTextAvailable
+        }
+
         binding.mediaMenu.toggleHideOnScroll(!config.scrollHorizontally && config.hideTopBarWhenScroll)
         binding.mediaMenu.setupMenu()
+
+        binding.mediaMenu.onSpeechToTextClickListener = {
+            speechToText()
+        }
 
         binding.mediaMenu.onSearchTextChangedListener = { text ->
             mLastSearchedText = text
@@ -391,14 +429,17 @@ class MediaActivity : SimpleActivity(), MediaOperationsListener {
     }
 
     private fun updateMenuColors() {
-        updateStatusbarColor(getProperBackgroundColor())
+        val useSurfaceColor = isDynamicTheme() && !isSystemInDarkMode()
+        val backgroundColor = if (useSurfaceColor) getSurfaceColor() else getProperBackgroundColor()
+        updateStatusbarColor(backgroundColor)
         binding.mediaMenu.updateColors(getStartRequiredStatusBarColor(), scrollingView?.computeVerticalScrollOffset() ?: 0)
     }
 
     private fun getStartRequiredStatusBarColor(): Int {
         val scrollingViewOffset = scrollingView?.computeVerticalScrollOffset() ?: 0
         return if (scrollingViewOffset == 0) {
-            getProperBackgroundColor()
+            val useSurfaceColor = isDynamicTheme() && !isSystemInDarkMode()
+            if (useSurfaceColor) getSurfaceColor() else getProperBackgroundColor()
         } else {
             getColoredMaterialStatusBarColor()
         }
@@ -417,7 +458,7 @@ class MediaActivity : SimpleActivity(), MediaOperationsListener {
             mStoredRoundedCorners = fileRoundedCorners
             mShowAll = showAll && mPath != RECYCLE_BIN
             mStoredHideTopBarWhenScroll = hideTopBarWhenScroll
-            tabsChanged = false
+            needRestart = false
         }
     }
 
@@ -444,7 +485,7 @@ class MediaActivity : SimpleActivity(), MediaOperationsListener {
                     handleGridSpacing(grouped)
                     getMediaAdapter()?.updateMedia(grouped)
                 }
-            } catch (ignored: Exception) {
+            } catch (_: Exception) {
             }
         }
     }
@@ -546,7 +587,7 @@ class MediaActivity : SimpleActivity(), MediaOperationsListener {
                 super.onScrolled(recyclerView, dx, dy)
 
                 // Ignore minor movements
-                if (Math.abs(dy) < SCROLL_THRESHOLD) return
+                if (abs(dy) < SCROLL_THRESHOLD) return
 
                 val layoutManager = recyclerView.layoutManager as LinearLayoutManager
                 val firstVisibleItemPosition = layoutManager.findFirstVisibleItemPosition()
@@ -627,7 +668,7 @@ class MediaActivity : SimpleActivity(), MediaOperationsListener {
     }
 
     private fun showSortingDialog() {
-        ChangeSortingDialog(this, false, true, mPath) {
+        ChangeSortingDialog(this, isDirectorySorting = false, showFolderCheckbox = true, path = mPath) {
             mLoadedInitialPhotos = false
             binding.mediaGrid.adapter = null
             getMedia()
@@ -707,7 +748,7 @@ class MediaActivity : SimpleActivity(), MediaOperationsListener {
             if (!fileDirItem.isDownloadsFolder() && fileDirItem.isDirectory) {
                 ensureBackgroundThread {
                     if (fileDirItem.getProperFileCount(this, true) == 0) {
-                        tryDeleteFileDirItem(fileDirItem, true, true)
+                        tryDeleteFileDirItem(fileDirItem, allowDeleteFolder = true, deleteFromDatabase = true)
                     }
                 }
             }
@@ -770,7 +811,7 @@ class MediaActivity : SimpleActivity(), MediaOperationsListener {
                                 mediaDB.deleteMediumPath(it.path)
                             }
                         }
-                } catch (e: Exception) {
+                } catch (_: Exception) {
                 }
             }
         }
@@ -809,7 +850,7 @@ class MediaActivity : SimpleActivity(), MediaOperationsListener {
         ensureBackgroundThread {
             try {
                 directoryDB.deleteDirPath(mPath)
-            } catch (ignored: Exception) {
+            } catch (_: Exception) {
             }
         }
     }
@@ -1015,7 +1056,7 @@ class MediaActivity : SimpleActivity(), MediaOperationsListener {
                         try {
                             WallpaperManager.getInstance(applicationContext).setBitmap(resource)
                             setResult(RESULT_OK)
-                        } catch (ignored: IOException) {
+                        } catch (_: IOException) {
                         }
 
                         finish()
@@ -1070,7 +1111,7 @@ class MediaActivity : SimpleActivity(), MediaOperationsListener {
                 binding.mediaEmptyTextPlaceholder.text = getString(R.string.no_media_with_filters)
             }
             binding.mediaFastscroller.beVisibleIf(binding.mediaEmptyTextPlaceholder.isGone())
-            setupAdapter()
+            if (!isFromCache) setupAdapter()
         }
 
         mLatestMediaId = getLatestMediaId()
@@ -1081,7 +1122,7 @@ class MediaActivity : SimpleActivity(), MediaOperationsListener {
             Thread {
                 try {
                     mediaDB.insertAll(mediaToInsert)
-                } catch (e: Exception) {
+                } catch (_: Exception) {
                 }
             }.start()
         }
@@ -1195,15 +1236,20 @@ class MediaActivity : SimpleActivity(), MediaOperationsListener {
 
     private fun setupTabsColor() {
         val tabBackground = when {
+            isDynamicTheme() && !isSystemInDarkMode() -> getProperBackgroundColor()
             isLightTheme() -> resources.getColor(R.color.tab_background_light)
             isGrayTheme() -> resources.getColor(R.color.tab_background_gray)
+            isDarkTheme() -> resources.getColor(R.color.tab_background_dark)
             isBlackTheme() -> resources.getColor(R.color.tab_background_black)
-            else -> getBottomNavigationBackgroundColor().adjustAlpha(0.95f)
+            else -> getSurfaceColor().adjustAlpha(0.95f)
         }
         binding.mainTopTabsBackground.backgroundTintList = ColorStateList.valueOf(tabBackground)
         binding.groupButton.backgroundTintList = ColorStateList.valueOf(tabBackground)
         binding.groupButton.setColorFilter(getProperTextColor())
-        binding.mainTopTabsHolder.setSelectedTabIndicatorColor(getProperBackgroundColor())
+
+        val useSurfaceColor = isDynamicTheme() && !isSystemInDarkMode()
+        val backgroundColor = if (useSurfaceColor) getSurfaceColor() else getProperBackgroundColor()
+        binding.mainTopTabsHolder.setSelectedTabIndicatorColor(backgroundColor)
         binding.mainTopTabsHolder.setTabTextColors(getProperTextColor(), getProperPrimaryColor())
     }
 
@@ -1290,28 +1336,33 @@ class MediaActivity : SimpleActivity(), MediaOperationsListener {
     }
 
     private fun getTabGroupBy(position: Int, tabType: Int): Int {
-        val stringId = if (tabType == 1) {
-            when (position) {
-                0 -> GROUP_BY_LAST_MODIFIED_YEARLY
-                1 -> GROUP_BY_LAST_MODIFIED_MONTHLY
-                2 -> GROUP_BY_LAST_MODIFIED_DAILY
-                else -> GROUP_BY_LAST_MODIFIED_NONE
+        val stringId = when (tabType) {
+            1 -> {
+                when (position) {
+                    0 -> GROUP_BY_LAST_MODIFIED_YEARLY
+                    1 -> GROUP_BY_LAST_MODIFIED_MONTHLY
+                    2 -> GROUP_BY_LAST_MODIFIED_DAILY
+                    else -> GROUP_BY_LAST_MODIFIED_NONE
+                }
             }
-        } else if (tabType == 2) {
-            when (position) {
-                0 -> GROUP_BY_DATE_TAKEN_YEARLY
-                1 -> GROUP_BY_DATE_TAKEN_MONTHLY
-                2 -> GROUP_BY_DATE_TAKEN_DAILY
-                else -> GROUP_BY_DATE_TAKEN_NONE
+            2 -> {
+                when (position) {
+                    0 -> GROUP_BY_DATE_TAKEN_YEARLY
+                    1 -> GROUP_BY_DATE_TAKEN_MONTHLY
+                    2 -> GROUP_BY_DATE_TAKEN_DAILY
+                    else -> GROUP_BY_DATE_TAKEN_NONE
+                }
             }
-        } else if (tabType == 3)  {
-            when (position) {
-                0 -> GROUP_BY_FILE_TYPE
-                1 -> GROUP_BY_EXTENSION
-                2 -> GROUP_BY_FOLDER
-                else -> GROUP_BY_OTHER_NONE
+            3 -> {
+                when (position) {
+                    0 -> GROUP_BY_FILE_TYPE
+                    1 -> GROUP_BY_EXTENSION
+                    2 -> GROUP_BY_FOLDER
+                    else -> GROUP_BY_OTHER_NONE
+                }
             }
-        } else GROUP_BY_NONE
+            else -> GROUP_BY_NONE
+        }
 
         return stringId
     }
@@ -1329,7 +1380,11 @@ class MediaActivity : SimpleActivity(), MediaOperationsListener {
         }
 
         mLoadedInitialPhotos = false
-        binding.mediaGrid.adapter = null
+//        binding.mediaGrid.adapter = null
         getMedia()
+
+        if (areSystemAnimationsEnabled) {
+            binding.mediaGrid.scheduleLayoutAnimation()
+        }
     }
 }

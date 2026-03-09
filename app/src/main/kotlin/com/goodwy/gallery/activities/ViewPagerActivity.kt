@@ -3,18 +3,20 @@ package com.goodwy.gallery.activities
 import android.animation.Animator
 import android.animation.ValueAnimator
 import android.annotation.SuppressLint
-import android.app.Activity
 import android.content.ActivityNotFoundException
 import android.content.ClipData
 import android.content.ClipboardManager
 import android.content.Intent
-import android.content.pm.ActivityInfo
+import android.content.pm.ActivityInfo.SCREEN_ORIENTATION_LANDSCAPE
+import android.content.pm.ActivityInfo.SCREEN_ORIENTATION_PORTRAIT
+import android.content.pm.ActivityInfo.SCREEN_ORIENTATION_REVERSE_LANDSCAPE
+import android.content.pm.ActivityInfo.SCREEN_ORIENTATION_SENSOR
+import android.content.pm.ActivityInfo.SCREEN_ORIENTATION_UNSPECIFIED
 import android.content.pm.ShortcutInfo
 import android.content.pm.ShortcutManager
 import android.content.res.Configuration
 import android.graphics.Bitmap
 import android.graphics.Color
-import android.graphics.drawable.ColorDrawable
 import android.graphics.drawable.Icon
 import android.os.Bundle
 import android.os.Handler
@@ -26,6 +28,7 @@ import android.widget.RelativeLayout
 import android.widget.Toast
 import androidx.annotation.OptIn
 import androidx.exifinterface.media.ExifInterface
+import androidx.lifecycle.lifecycleScope
 import androidx.media3.common.util.UnstableApi
 import androidx.print.PrintHelper
 import androidx.viewpager.widget.ViewPager
@@ -56,8 +59,12 @@ import com.goodwy.gallery.fragments.ViewPagerFragment
 import com.goodwy.gallery.helpers.*
 import com.goodwy.gallery.models.Medium
 import com.goodwy.gallery.models.ThumbnailItem
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 import java.io.File
 import kotlin.math.min
+import androidx.core.graphics.drawable.toDrawable
 
 @Suppress("UNCHECKED_CAST")
 class ViewPagerActivity : SimpleActivity(), ViewPager.OnPageChangeListener, ViewPagerFragment.FragmentListener {
@@ -225,7 +232,6 @@ class ViewPagerActivity : SimpleActivity(), ViewPager.OnPageChangeListener, View
                 findItem(R.id.menu_restore_file).isVisible = currentMedium.path.startsWith(recycleBinPath)
                 findItem(R.id.menu_create_shortcut).isVisible = true
                 findItem(R.id.menu_change_orientation).isVisible = rotationDegrees == 0 && visibleBottomActions and BOTTOM_ACTION_CHANGE_ORIENTATION == 0
-                findItem(R.id.menu_change_orientation).icon = resources.getDrawable(getChangeOrientationIcon())
                 findItem(R.id.menu_rotate).setShowAsAction(
                     if (rotationDegrees != 0) {
                         MenuItem.SHOW_AS_ACTION_ALWAYS
@@ -282,9 +288,10 @@ class ViewPagerActivity : SimpleActivity(), ViewPager.OnPageChangeListener, View
                 R.id.menu_add_to_favorites -> toggleFavorite()
                 R.id.menu_remove_from_favorites -> toggleFavorite()
                 R.id.menu_restore_file -> restoreFile()
-                R.id.menu_force_portrait -> toggleOrientation(ActivityInfo.SCREEN_ORIENTATION_PORTRAIT)
-                R.id.menu_force_landscape -> toggleOrientation(ActivityInfo.SCREEN_ORIENTATION_LANDSCAPE)
-                R.id.menu_default_orientation -> toggleOrientation(ActivityInfo.SCREEN_ORIENTATION_UNSPECIFIED)
+                R.id.menu_force_portrait -> toggleOrientation(SCREEN_ORIENTATION_PORTRAIT)
+                R.id.menu_force_landscape -> toggleOrientation(SCREEN_ORIENTATION_LANDSCAPE)
+                R.id.menu_force_landscape_reverse -> toggleOrientation(SCREEN_ORIENTATION_REVERSE_LANDSCAPE)
+                R.id.menu_default_orientation -> toggleOrientation(SCREEN_ORIENTATION_UNSPECIFIED)
                 R.id.menu_save_as -> saveImageAs()
                 R.id.menu_create_shortcut -> createShortcut()
                 R.id.menu_resize -> resizeImage()
@@ -301,13 +308,13 @@ class ViewPagerActivity : SimpleActivity(), ViewPager.OnPageChangeListener, View
     }
 
     override fun onActivityResult(requestCode: Int, resultCode: Int, resultData: Intent?) {
-        if (requestCode == REQUEST_EDIT_IMAGE && resultCode == Activity.RESULT_OK && resultData != null) {
+        if (requestCode == REQUEST_EDIT_IMAGE && resultCode == RESULT_OK && resultData != null) {
             mPos = -1
             mPrevHashcode = 0
             refreshViewPager()
-        } else if (requestCode == REQUEST_SET_AS && resultCode == Activity.RESULT_OK) {
+        } else if (requestCode == REQUEST_SET_AS && resultCode == RESULT_OK) {
             toast(R.string.wallpaper_set_successfully)
-        } else if (requestCode == REQUEST_VIEW_VIDEO && resultCode == Activity.RESULT_OK && resultData != null) {
+        } else if (requestCode == REQUEST_VIEW_VIDEO && resultCode == RESULT_OK && resultData != null) {
             if (resultData.getBooleanExtra(GO_TO_NEXT_ITEM, false)) {
                 goToNextItem()
             } else if (resultData.getBooleanExtra(GO_TO_PREV_ITEM, false)) {
@@ -390,9 +397,11 @@ class ViewPagerActivity : SimpleActivity(), ViewPager.OnPageChangeListener, View
 
     private fun initContinue() {
         if (intent.extras?.containsKey(IS_VIEW_INTENT) == true) {
-            if (isShowHiddenFlagNeeded()) {
-                if (!config.isHiddenPasswordProtectionOn) {
-                    config.temporarilyShowHidden = true
+            lifecycleScope.launch {
+                if (isShowHiddenFlagNeeded()) {
+                    if (!config.isHiddenPasswordProtectionOn) {
+                        config.temporarilyShowHidden = true
+                    }
                 }
             }
 
@@ -431,7 +440,7 @@ class ViewPagerActivity : SimpleActivity(), ViewPager.OnPageChangeListener, View
         binding.viewPager.offscreenPageLimit = 2
 
         if (config.blackBackground) {
-            binding.viewPager.background = ColorDrawable(Color.BLACK) //TODO always black background
+            binding.viewPager.background = Color.BLACK.toDrawable() //TODO always black background
         }
 
         if (config.hideSystemUI) {
@@ -497,9 +506,9 @@ class ViewPagerActivity : SimpleActivity(), ViewPager.OnPageChangeListener, View
     private fun setupOrientation() {
         if (!mIsOrientationLocked) {
             if (config.screenRotation == ROTATE_BY_DEVICE_ROTATION) {
-                requestedOrientation = ActivityInfo.SCREEN_ORIENTATION_SENSOR
+                requestedOrientation = SCREEN_ORIENTATION_SENSOR
             } else if (config.screenRotation == ROTATE_BY_SYSTEM_SETTING) {
-                requestedOrientation = ActivityInfo.SCREEN_ORIENTATION_UNSPECIFIED
+                requestedOrientation = SCREEN_ORIENTATION_UNSPECIFIED
             }
         }
     }
@@ -573,7 +582,7 @@ class ViewPagerActivity : SimpleActivity(), ViewPager.OnPageChangeListener, View
                 if (binding.viewPager.isFakeDragging) {
                     try {
                         binding.viewPager.endFakeDrag()
-                    } catch (ignored: Exception) {
+                    } catch (_: Exception) {
                         stopSlideshow()
                     }
 
@@ -608,7 +617,7 @@ class ViewPagerActivity : SimpleActivity(), ViewPager.OnPageChangeListener, View
                     oldDragPosition = dragPosition
                     try {
                         binding.viewPager.fakeDragBy(dragOffset * (if (forward) -1f else 1f))
-                    } catch (e: Exception) {
+                    } catch (_: Exception) {
                         stopSlideshow()
                     }
                 }
@@ -647,7 +656,7 @@ class ViewPagerActivity : SimpleActivity(), ViewPager.OnPageChangeListener, View
         }
     }
 
-    @androidx.annotation.OptIn(UnstableApi::class)
+    @OptIn(UnstableApi::class)
     private fun scheduleSwipe() {
         mSlideshowHandler.removeCallbacksAndMessages(null)
         if (mIsSlideshowActive) {
@@ -764,13 +773,13 @@ class ViewPagerActivity : SimpleActivity(), ViewPager.OnPageChangeListener, View
 
     private fun toggleOrientation(orientation: Int) {
         requestedOrientation = orientation
-        mIsOrientationLocked = orientation != ActivityInfo.SCREEN_ORIENTATION_UNSPECIFIED
+        mIsOrientationLocked = orientation != SCREEN_ORIENTATION_UNSPECIFIED
         refreshMenuItems()
     }
 
     private fun getChangeOrientationIcon(): Int {
         return if (mIsOrientationLocked) {
-            if (requestedOrientation == ActivityInfo.SCREEN_ORIENTATION_PORTRAIT) {
+            if (requestedOrientation == SCREEN_ORIENTATION_PORTRAIT) {
                 R.drawable.ic_orientation_portrait_vector
             } else {
                 R.drawable.ic_orientation_landscape_vector
@@ -782,9 +791,9 @@ class ViewPagerActivity : SimpleActivity(), ViewPager.OnPageChangeListener, View
 
     private fun saveImageAs() {
         val currPath = getCurrentPath()
-        SaveAsDialog(this, currPath, false) {
+        SaveAsDialog(this, currPath, false) { it ->
             val newPath = it
-            handleSAFDialog(it) {
+            handleSAFDialog(it) { it ->
                 if (!it) {
                     return@handleSAFDialog
                 }
@@ -833,25 +842,25 @@ class ViewPagerActivity : SimpleActivity(), ViewPager.OnPageChangeListener, View
 
     private fun getPortraitPath() = intent.getStringExtra(PORTRAIT_PATH) ?: ""
 
-    private fun isShowHiddenFlagNeeded(): Boolean {
+    private suspend fun isShowHiddenFlagNeeded(): Boolean = withContext(Dispatchers.IO) {
         val file = File(mPath)
         if (file.isHidden) {
-            return true
+            return@withContext true
         }
 
-        var parent = file.parentFile ?: return false
+        var parent = file.parentFile ?: return@withContext false
         while (true) {
             if (parent.isHidden || parent.list()?.any { it.startsWith(NOMEDIA) } == true) {
-                return true
+                return@withContext true
             }
 
             if (parent.absolutePath == "/") {
                 break
             }
-            parent = parent.parentFile ?: return false
+            parent = parent.parentFile ?: return@withContext false
         }
 
-        return false
+        return@withContext false
     }
 
     private fun getCurrentFragment() = (binding.viewPager.adapter as? MyPagerAdapter)?.getCurrentFragment(binding.viewPager.currentItem)
@@ -877,7 +886,7 @@ class ViewPagerActivity : SimpleActivity(), ViewPager.OnPageChangeListener, View
         }
     }
 
-    @androidx.annotation.OptIn(UnstableApi::class)
+    @OptIn(UnstableApi::class)
     private fun initBottomActionButtons() {
         val iconColor = if (baseConfig.topAppBarColorIcon) getProperPrimaryColor() else Color.WHITE
         arrayListOf(
@@ -935,11 +944,12 @@ class ViewPagerActivity : SimpleActivity(), ViewPager.OnPageChangeListener, View
         binding.bottomActions.bottomChangeOrientation.setOnLongClickListener { toast(R.string.change_orientation); true }
         binding.bottomActions.bottomChangeOrientation.setOnClickListener {
             requestedOrientation = when (requestedOrientation) {
-                ActivityInfo.SCREEN_ORIENTATION_PORTRAIT -> ActivityInfo.SCREEN_ORIENTATION_LANDSCAPE
-                ActivityInfo.SCREEN_ORIENTATION_LANDSCAPE -> ActivityInfo.SCREEN_ORIENTATION_UNSPECIFIED
-                else -> ActivityInfo.SCREEN_ORIENTATION_PORTRAIT
+                SCREEN_ORIENTATION_PORTRAIT -> SCREEN_ORIENTATION_LANDSCAPE
+                SCREEN_ORIENTATION_LANDSCAPE -> SCREEN_ORIENTATION_REVERSE_LANDSCAPE
+                SCREEN_ORIENTATION_REVERSE_LANDSCAPE -> SCREEN_ORIENTATION_UNSPECIFIED
+                else -> SCREEN_ORIENTATION_PORTRAIT
             }
-            mIsOrientationLocked = requestedOrientation != ActivityInfo.SCREEN_ORIENTATION_UNSPECIFIED
+            mIsOrientationLocked = requestedOrientation != SCREEN_ORIENTATION_UNSPECIFIED
             updateBottomActionIcons(currentMedium)
         }
 
@@ -1062,7 +1072,7 @@ class ViewPagerActivity : SimpleActivity(), ViewPager.OnPageChangeListener, View
     private fun sendPrintIntent(path: String) {
         val printHelper = PrintHelper(this)
         printHelper.scaleMode = PrintHelper.SCALE_MODE_FIT
-        printHelper.orientation = ActivityInfo.SCREEN_ORIENTATION_PORTRAIT
+        printHelper.orientation = SCREEN_ORIENTATION_PORTRAIT
 
         try {
             val resolution = path.getImageResolution(this)
@@ -1107,7 +1117,7 @@ class ViewPagerActivity : SimpleActivity(), ViewPager.OnPageChangeListener, View
                         return false
                     }
                 }).submit(requestedWidth, requestedHeight)
-        } catch (e: Exception) {
+        } catch (_: Exception) {
         }
     }
 
@@ -1295,6 +1305,7 @@ class ViewPagerActivity : SimpleActivity(), ViewPager.OnPageChangeListener, View
         }
     }
 
+    @OptIn(UnstableApi::class)
     private fun gotMedia(thumbnailItems: ArrayList<ThumbnailItem>, ignorePlayingVideos: Boolean = false, refetchViewPagerPosition: Boolean = false) {
         val media = thumbnailItems.asSequence().filter {
             it is Medium && !mIgnoredPaths.contains(it.path)
@@ -1374,15 +1385,15 @@ class ViewPagerActivity : SimpleActivity(), ViewPager.OnPageChangeListener, View
                 val exif = ExifInterface(pathToLoad)
                 val orientation = exif.getAttributeInt(ExifInterface.TAG_ORIENTATION, -1)
                 flipSides = orientation == ExifInterface.ORIENTATION_ROTATE_90 || orientation == ExifInterface.ORIENTATION_ROTATE_270
-            } catch (e: Exception) {
+            } catch (_: Exception) {
             }
             val resolution = applicationContext.getResolution(getCurrentPath()) ?: return
             val width = if (flipSides) resolution.y else resolution.x
             val height = if (flipSides) resolution.x else resolution.y
             if (width > height) {
-                requestedOrientation = ActivityInfo.SCREEN_ORIENTATION_LANDSCAPE
+                requestedOrientation = SCREEN_ORIENTATION_LANDSCAPE
             } else if (width < height) {
-                requestedOrientation = ActivityInfo.SCREEN_ORIENTATION_PORTRAIT
+                requestedOrientation = SCREEN_ORIENTATION_PORTRAIT
             }
         }
     }
@@ -1428,7 +1439,7 @@ class ViewPagerActivity : SimpleActivity(), ViewPager.OnPageChangeListener, View
 
                 try {
                     startActivityForResult(this, REQUEST_VIEW_VIDEO)
-                } catch (e: ActivityNotFoundException) {
+                } catch (_: ActivityNotFoundException) {
                     if (!tryGenericMimeType(this, mimeType, newUri)) {
                         toast(com.goodwy.commons.R.string.no_app_found)
                     }

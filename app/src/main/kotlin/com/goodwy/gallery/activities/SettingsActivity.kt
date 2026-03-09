@@ -1,7 +1,6 @@
 package com.goodwy.gallery.activities
 
 import android.annotation.SuppressLint
-import android.app.Activity
 import android.content.ActivityNotFoundException
 import android.content.Intent
 import android.os.Bundle
@@ -157,6 +156,7 @@ class SettingsActivity : SimpleActivity() {
         setupManageIncludedFolders()
         setupManageExcludedFolders()
         setupManageHiddenFolders()
+        setupUseSpeechToText()
         setupHideGroupingBar()
         setupHideGroupingButton()
         setupShowHiddenItems()
@@ -173,6 +173,7 @@ class SettingsActivity : SimpleActivity() {
         setupMaxBrightness()
         setupCropThumbnails()
         setupAnimateGifs()
+        setupThumbnailCacheSize()
 
         setupScrollHorizontally()
         setupEnablePullToRefresh()
@@ -227,6 +228,7 @@ class SettingsActivity : SimpleActivity() {
 
         updateTextColors(binding.settingsHolder)
 
+        val properPrimaryColor = getProperPrimaryColor()
         arrayOf(
             binding.settingsAppearanceLabel,
             binding.settingsGeneralLabel,
@@ -243,9 +245,10 @@ class SettingsActivity : SimpleActivity() {
             binding.settingsBackupsLabel,
             binding.settingsOtherLabel
         ).forEach {
-            it.setTextColor(getProperPrimaryColor())
+            it.setTextColor(properPrimaryColor)
         }
 
+        val surfaceColor = getSurfaceColor()
         arrayOf(
             binding.settingsColorCustomizationHolder,
             binding.settingsGeneralHolder,
@@ -262,9 +265,10 @@ class SettingsActivity : SimpleActivity() {
             binding.settingsBackupsHolder,
             binding.settingsOtherHolder
         ).forEach {
-            it.setCardBackgroundColor(getBottomNavigationBackgroundColor())
+            it.setCardBackgroundColor(surfaceColor)
         }
 
+        val properTextColor = getProperTextColor()
         arrayOf(
             binding.settingsCustomizeColorsChevron,
             binding.settingsManageIncludedFoldersChevron,
@@ -280,19 +284,19 @@ class SettingsActivity : SimpleActivity() {
             binding.settingsTipJarChevron,
             binding.settingsAboutChevron
         ).forEach {
-            it.applyColorFilter(getProperTextColor())
+            it.applyColorFilter(properTextColor)
         }
     }
 
     override fun onActivityResult(requestCode: Int, resultCode: Int, resultData: Intent?) {
         super.onActivityResult(requestCode, resultCode, resultData)
-        if (requestCode == PICK_IMPORT_SOURCE_INTENT && resultCode == Activity.RESULT_OK && resultData != null && resultData.data != null) {
+        if (requestCode == PICK_IMPORT_SOURCE_INTENT && resultCode == RESULT_OK && resultData != null && resultData.data != null) {
             val inputStream = contentResolver.openInputStream(resultData.data!!)
             parseFile(inputStream)
-        } else if (requestCode == SELECT_EXPORT_FAVORITES_FILE_INTENT && resultCode == Activity.RESULT_OK && resultData != null && resultData.data != null) {
+        } else if (requestCode == SELECT_EXPORT_FAVORITES_FILE_INTENT && resultCode == RESULT_OK && resultData != null && resultData.data != null) {
             val outputStream = contentResolver.openOutputStream(resultData.data!!)
             exportFavoritesTo(outputStream)
-        } else if (requestCode == SELECT_IMPORT_FAVORITES_FILE_INTENT && resultCode == Activity.RESULT_OK && resultData != null && resultData.data != null) {
+        } else if (requestCode == SELECT_IMPORT_FAVORITES_FILE_INTENT && resultCode == RESULT_OK && resultData != null && resultData.data != null) {
             val inputStream = contentResolver.openInputStream(resultData.data!!)
             importFavorites(inputStream)
         }
@@ -306,7 +310,7 @@ class SettingsActivity : SimpleActivity() {
     private fun setupCustomizeColors() = binding.apply {
         settingsCustomizeColorsHolder.setOnClickListener {
             startCustomizationActivity(
-                showAccentColor = false,
+                showAccentColor = true,
                 isCollection = isCollection(),
                 productIdList= arrayListOf(productIdX1, productIdX2, productIdX3),
                 productIdListRu = arrayListOf(productIdX1, productIdX2, productIdX4),
@@ -386,9 +390,13 @@ class SettingsActivity : SimpleActivity() {
 
     private fun setupLanguage() = binding.apply {
         settingsLanguage.text = Locale.getDefault().displayLanguage
-        settingsLanguageHolder.beVisibleIf(isTiramisuPlus())
-        settingsLanguageHolder.setOnClickListener {
-            launchChangeAppLanguageIntent()
+        if (isTiramisuPlus()) {
+            settingsLanguageHolder.beVisible()
+            settingsLanguageHolder.setOnClickListener {
+                launchChangeAppLanguageIntent()
+            }
+        } else {
+            settingsLanguageHolder.beGone()
         }
     }
 
@@ -461,13 +469,22 @@ class SettingsActivity : SimpleActivity() {
         }
     }
 
+    private fun setupUseSpeechToText() = binding.apply {
+        settingsUseSpeechToText.isChecked = config.useSpeechToText
+        settingsUseSpeechToTextHolder.setOnClickListener {
+            settingsUseSpeechToText.toggle()
+            config.useSpeechToText = settingsUseSpeechToText.isChecked
+            config.needRestart = true
+        }
+    }
+
     private fun setupHideGroupingBar() {
         binding.settingsHideGroupingBar.isChecked = config.hideGroupingBar
         binding.settingsHideGroupingBarHolder.setOnClickListener {
             binding.settingsHideGroupingBar.toggle()
             config.hideGroupingBar = binding.settingsHideGroupingBar.isChecked
             binding.settingsHideGroupingButtonHolder.beGoneIf(config.hideGroupingBar)
-            config.tabsChanged = true
+            config.needRestart = true
         }
     }
 
@@ -477,7 +494,7 @@ class SettingsActivity : SimpleActivity() {
         binding.settingsHideGroupingButtonHolder.setOnClickListener {
             binding.settingsHideGroupingButton.toggle()
             config.hideGroupingButton = binding.settingsHideGroupingButton.isChecked
-            config.tabsChanged = true
+            config.needRestart = true
         }
     }
 
@@ -573,6 +590,26 @@ class SettingsActivity : SimpleActivity() {
         }
     }
 
+    private fun setupThumbnailCacheSize() {
+        binding.settingsThumbnailCacheSize.text = getThumbnailCacheSizeText()
+        binding.settingsThumbnailCacheSizeHolder.setOnClickListener {
+            val items = arrayListOf(
+                RadioItem(100, "100 MB"),
+                RadioItem(256, "256 MB"),
+                RadioItem(512, "512 MB"),
+                RadioItem(1024, "1024 MB"),
+                RadioItem(2048, "2048 MB")
+            )
+            RadioGroupDialog(this@SettingsActivity, items, config.diskCacheSizeMB, R.string.thumbnail_cache_size) {
+                config.diskCacheSizeMB = it as Int
+                binding.settingsThumbnailCacheSize.text = getThumbnailCacheSizeText()
+                toast(R.string.thumbnail_cache_size_restart)
+            }
+        }
+    }
+
+    private fun getThumbnailCacheSizeText() = "${config.diskCacheSizeMB} MB"
+
     private fun setupDarkBackground() {
         binding.settingsBlackBackground.isChecked = config.blackBackground
         binding.settingsBlackBackgroundHolder.setOnClickListener {
@@ -624,7 +661,7 @@ class SettingsActivity : SimpleActivity() {
             settingsChangeColourTopBarHolder.setOnClickListener {
                 settingsChangeColourTopBar.toggle()
                 config.changeColourTopBar = settingsChangeColourTopBar.isChecked
-                config.tabsChanged = true
+                config.needRestart = true
             }
         }
     }
@@ -1417,7 +1454,7 @@ class SettingsActivity : SimpleActivity() {
     private fun setupTipJar() = binding.apply {
         settingsTipJarHolder.apply {
             beVisibleIf(isPro())
-            background.applyColorFilter(getBottomNavigationBackgroundColor().lightenColor(4))
+            background.applyColorFilter(getColoredMaterialStatusBarColor())
             setOnClickListener {
                 launchPurchase()
             }

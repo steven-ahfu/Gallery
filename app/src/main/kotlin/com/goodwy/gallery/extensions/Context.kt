@@ -7,13 +7,19 @@ import android.content.Context
 import android.content.Intent
 import android.database.Cursor
 import android.graphics.Bitmap
+import android.graphics.Bitmap.CompressFormat
 import android.graphics.drawable.Drawable
 import android.graphics.drawable.PictureDrawable
 import android.media.AudioManager
+import android.net.Uri
 import android.os.Process
+import android.os.SystemClock
 import android.provider.MediaStore.Files
 import android.provider.MediaStore.Images
+import android.util.Log
 import android.widget.ImageView
+import androidx.core.net.toUri
+import androidx.documentfile.provider.DocumentFile
 import com.bumptech.glide.Glide
 import com.bumptech.glide.Priority
 import com.bumptech.glide.integration.webp.WebpBitmapFactory
@@ -52,6 +58,78 @@ import kotlin.math.max
 import kotlin.math.min
 
 val Context.audioManager get() = getSystemService(Context.AUDIO_SERVICE) as AudioManager
+
+private const val MEDIA_DB_MAINTENANCE_LOG_TAG = "MediaDbMaintenance"
+private const val MEDIA_DB_MAINTENANCE_INTERVAL_MS = 6 * 60 * 60 * 1000L
+private const val MEDIA_DB_MAINTENANCE_MAX_DURATION_MS = 250L
+private const val MEDIA_DB_MAINTENANCE_BATCH_SIZE = 100
+
+fun Context.maybeRunMediaDbMaintenance(force: Boolean = false) {
+    val now = System.currentTimeMillis()
+    val elapsedSinceLastRun = now - config.lastMediaDbMaintenance
+    if (!force && elapsedSinceLastRun in 0 until MEDIA_DB_MAINTENANCE_INTERVAL_MS) {
+        return
+    }
+
+    config.lastMediaDbMaintenance = now
+    Thread { runMediaDbMaintenance() }.start()
+}
+
+private fun Context.runMediaDbMaintenance(maxDurationMs: Long = MEDIA_DB_MAINTENANCE_MAX_DURATION_MS) {
+    try {
+        val startTs = SystemClock.elapsedRealtime()
+        val beforeTotal = mediaDB.getTotalRowCount()
+        val beforeByFolder = mediaDB.getRowCountByFolder()
+
+        var deletedRows = 0
+        var deletedFavoriteRows = 0
+        var lastId = 0L
+        val otgPath = config.OTGPath
+
+        while (SystemClock.elapsedRealtime() - startTs < maxDurationMs) {
+            val candidates = mediaDB.getCleanupCandidates(lastId, MEDIA_DB_MAINTENANCE_BATCH_SIZE)
+            if (candidates.isEmpty()) {
+                break
+            }
+
+            lastId = candidates.last().id
+            val staleCandidates = candidates.filter { candidate ->
+                val dbPath = candidate.path
+                val pathToCheck = if (candidate.deletedTS != 0L && dbPath.startsWith(RECYCLE_BIN)) {
+                    File(recycleBinPath, dbPath.removePrefix(RECYCLE_BIN)).toString()
+                } else {
+                    dbPath
+                }
+
+                !getDoesFilePathExist(pathToCheck, otgPath)
+            }
+
+            if (staleCandidates.isEmpty()) {
+                continue
+            }
+
+            val staleIds = staleCandidates.map { it.id }
+            deletedRows += mediaDB.deleteByIds(staleIds)
+
+            staleCandidates.filter { it.isFavorite && it.deletedTS == 0L }.forEach { staleCandidate ->
+                favoritesDB.deleteFavoritePath(staleCandidate.path)
+                deletedFavoriteRows++
+            }
+        }
+
+        val afterTotal = mediaDB.getTotalRowCount()
+        val afterByFolder = mediaDB.getRowCountByFolder()
+        val beforeFolderSummary = beforeByFolder.sortedByDescending { it.rowCount }.take(5).joinToString { "${it.parentPath}:${it.rowCount}" }
+        val afterFolderSummary = afterByFolder.sortedByDescending { it.rowCount }.take(5).joinToString { "${it.parentPath}:${it.rowCount}" }
+
+        Log.i(
+            MEDIA_DB_MAINTENANCE_LOG_TAG,
+            "DB maintenance before=$beforeTotal after=$afterTotal deleted=$deletedRows deletedFavorites=$deletedFavoriteRows beforeFolders=${beforeByFolder.size}[$beforeFolderSummary] afterFolders=${afterByFolder.size}[$afterFolderSummary]"
+        )
+    } catch (e: Exception) {
+        Log.w(MEDIA_DB_MAINTENANCE_LOG_TAG, "Failed to run media DB maintenance", e)
+    }
+}
 
 fun Context.getHumanizedFilename(path: String): String {
     val humanized = humanizePath(path)
@@ -538,7 +616,9 @@ fun Context.loadImage(
     cropThumbnails: Boolean,
     roundCorners: Int,
     signature: ObjectKey,
+    highPriority: Boolean = false,
     skipMemoryCacheAtPaths: ArrayList<String>? = null,
+    loadHighPriority: Boolean = false,
     onError: (() -> Unit)? = null
 ) {
     target.isHorizontalScrolling = horizontalScroll
@@ -557,9 +637,11 @@ fun Context.loadImage(
             cropThumbnails = cropThumbnails,
             roundCorners = roundCorners,
             signature = signature,
+            highPriority = highPriority,
             skipMemoryCacheAtPaths = skipMemoryCacheAtPaths,
             animate = animateGifs,
             tryLoadingWithPicasso = type == TYPE_IMAGES && path.isPng(),
+            loadHighPriority = loadHighPriority,
             onError = onError
         )
     }
@@ -605,16 +687,19 @@ fun Context.loadImageBase(
     cropThumbnails: Boolean,
     roundCorners: Int,
     signature: ObjectKey,
+    highPriority: Boolean = false,
     skipMemoryCacheAtPaths: ArrayList<String>? = null,
     animate: Boolean = false,
     tryLoadingWithPicasso: Boolean = false,
     crossFadeDuration: Int = THUMBNAIL_FADE_DURATION_MS,
+    skipThumbnail: Boolean = false,
+    loadHighPriority: Boolean = false,
     onError: (() -> Unit)? = null
 ) {
     val options = RequestOptions()
         .signature(signature)
         .skipMemoryCache(skipMemoryCacheAtPaths?.contains(path) == true)
-        .priority(Priority.LOW)
+        .priority(if (highPriority) Priority.HIGH else Priority.NORMAL)
         .diskCacheStrategy(DiskCacheStrategy.RESOURCE)
         .format(DecodeFormat.PREFER_ARGB_8888)
 
@@ -686,7 +771,60 @@ fun Context.loadImageBase(
         ) = false
     })
 
+    if (!skipThumbnail) {
+        builder = builder.thumbnail(0.1f)
+    }
+
     builder.into(target)
+}
+
+fun Context.preloadImageBase(
+    path: String,
+    cropThumbnails: Boolean,
+    roundCorners: Int,
+    signature: ObjectKey,
+    highPriority: Boolean = false,
+    skipMemoryCache: Boolean = false,
+): Target<Drawable> {
+    val options = RequestOptions()
+        .signature(signature)
+        .skipMemoryCache(skipMemoryCache)
+        .priority(if (highPriority) Priority.HIGH else Priority.NORMAL)
+        .diskCacheStrategy(DiskCacheStrategy.RESOURCE)
+        .format(DecodeFormat.PREFER_ARGB_8888)
+
+    if (cropThumbnails) {
+        options.optionalTransform(CenterCrop())
+        options.optionalTransform(
+            WebpDrawable::class.java,
+            WebpDrawableTransformation(CenterCrop())
+        )
+    } else {
+        options.optionalTransform(FitCenter())
+        options.optionalTransform(WebpDrawable::class.java, WebpDrawableTransformation(FitCenter()))
+    }
+
+    if (roundCorners != ROUNDED_CORNERS_NONE) {
+        val cornerSize =
+            if (roundCorners == ROUNDED_CORNERS_SMALL) com.goodwy.commons.R.dimen.rounded_corner_radius_big else com.goodwy.commons.R.dimen.dialog_corner_radius
+        val cornerRadius = resources.getDimension(cornerSize).toInt()
+        val roundedCornersTransform = RoundedCorners(cornerRadius)
+        options.optionalTransform(MultiTransformation(CenterCrop(), roundedCornersTransform))
+        options.optionalTransform(
+            WebpDrawable::class.java,
+            MultiTransformation(
+                WebpDrawableTransformation(CenterCrop()),
+                WebpDrawableTransformation(roundedCornersTransform)
+            )
+        )
+    }
+
+    WebpBitmapFactory.sUseSystemDecoder = false // CVE-2023-4863
+    return Glide.with(applicationContext)
+        .load(path)
+        .apply(options)
+        .set(WebpDownsampler.USE_SYSTEM_DECODER, false) // CVE-2023-4863
+        .preload()
 }
 
 fun Context.loadSVG(
@@ -909,7 +1047,7 @@ fun Context.getCachedMedia(
             }
         }) as ArrayList<Medium>
 
-        val pathToUse = if (path.isEmpty()) SHOW_ALL else path
+        val pathToUse = path.ifEmpty { SHOW_ALL }
         mediaFetcher.sortMedia(media, config.getFolderSorting(pathToUse))
         val grouped = mediaFetcher.groupMedia(media, pathToUse)
         callback(grouped.clone() as ArrayList<ThumbnailItem>)
@@ -1335,6 +1473,28 @@ fun Context.getFileDateTaken(path: String): Long {
     }
 
     return 0L
+}
+
+fun Context.getCompressionFormatFromUri(uri: Uri): CompressFormat {
+    val type = getMimeTypeFromUri(uri)
+    return when {
+        type.equals("image/png", true) -> CompressFormat.PNG
+        type.equals("image/webp", true) -> CompressFormat.WEBP
+        else -> CompressFormat.JPEG
+    }
+}
+
+fun Context.resolveUriScheme(
+    uri: Uri,
+    onPath: (String) -> Unit,
+    onContentUri: (Uri) -> Unit,
+    onUnknown: () -> Unit = { toast(R.string.unknown_file_location) }
+) {
+    when (uri.scheme) {
+        "file" -> onPath(uri.path!!)
+        "content" -> onContentUri(uri)
+        else -> onUnknown()
+    }
 }
 
 fun Context.getTextSizeDir(fontSizeDir: Int = config.fontSizeDir) = when (fontSizeDir) {

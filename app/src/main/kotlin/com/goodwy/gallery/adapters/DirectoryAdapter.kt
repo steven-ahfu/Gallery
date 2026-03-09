@@ -1,5 +1,6 @@
 package com.goodwy.gallery.adapters
 
+import android.annotation.SuppressLint
 import android.content.Intent
 import android.content.pm.ShortcutInfo
 import android.content.pm.ShortcutManager
@@ -17,7 +18,9 @@ import androidx.appcompat.content.res.AppCompatResources
 import androidx.recyclerview.widget.ItemTouchHelper
 import androidx.recyclerview.widget.RecyclerView
 import androidx.swiperefreshlayout.widget.SwipeRefreshLayout
+import androidx.recyclerview.widget.LinearLayoutManager
 import com.bumptech.glide.Glide
+import com.bumptech.glide.request.target.Target
 import com.google.gson.Gson
 import com.qtalk.recyclerviewfastscroller.RecyclerViewFastScroller
 import com.goodwy.commons.activities.BaseSimpleActivity
@@ -70,6 +73,9 @@ class DirectoryAdapter(
     private var lockedFolderPaths = ArrayList<String>()
     private var isDragAndDropping = false
     private var startReorderDragListener: StartReorderDragListener? = null
+    private val preloadTargets: MutableList<Target<*>> = mutableListOf()
+    private val prefetchItemBudget = 20
+    private var directoryRecyclerView: RecyclerView? = null
 
     private var showMediaCount = config.showFolderMediaCount
     private var folderStyle = config.folderStyle
@@ -78,6 +84,8 @@ class DirectoryAdapter(
     var dateFormat = config.dateFormat
     var timeFormat = activity.getTimeFormat()
     private val fontSizeDir = config.fontSizeDir
+
+    private val keyToPositionCache = mutableMapOf<Int, Int>()
 
     init {
         setupDragListener(true)
@@ -96,7 +104,7 @@ class DirectoryAdapter(
         return createViewHolder(binding.root)
     }
 
-    override fun onBindViewHolder(holder: MyRecyclerViewAdapter.ViewHolder, position: Int) {
+    override fun onBindViewHolder(holder: ViewHolder, position: Int) {
         val dir = dirs.getOrNull(position) ?: return
         holder.bindView(dir, true, !isPickIntent) { itemView, adapterPosition ->
             setupView(itemView, dir, holder)
@@ -169,7 +177,10 @@ class DirectoryAdapter(
 
     override fun getItemSelectionKey(position: Int) = dirs.getOrNull(position)?.path?.hashCode()
 
-    override fun getItemKeyPosition(key: Int) = dirs.indexOfFirst { it.path.hashCode() == key }
+//    override fun getItemKeyPosition(key: Int) = dirs.indexOfFirst { it.path.hashCode() == key }
+    override fun getItemKeyPosition(key: Int): Int {
+        return keyToPositionCache[key] ?: dirs.indexOfFirst { (it as? Directory)?.path?.hashCode() == key }
+    }
 
     override fun onActionModeCreated() {
         swipeRefreshLayout?.isRefreshing = false
@@ -211,7 +222,7 @@ class DirectoryAdapter(
     }
 
     private fun moveSelectedItemsToTop() {
-        selectedKeys.reversed().forEach { key ->
+        selectedKeys.toList().reversed().forEach { key ->
             val position = dirs.indexOfFirst { it.path.hashCode() == key }
             val tempItem = dirs[position]
             dirs.removeAt(position)
@@ -761,7 +772,13 @@ class DirectoryAdapter(
             dirs = directories
             fillLockedFolders()
             notifyDataSetChanged()
+            clearPrefetchRequests()
+            prefetchDirectoryThumbnails()
             finishActMode()
+        }
+        keyToPositionCache.clear()
+        newDirs.forEachIndexed { index, item ->
+            keyToPositionCache[item.path.hashCode()] = index
         }
     }
 
@@ -775,6 +792,7 @@ class DirectoryAdapter(
         notifyDataSetChanged()
     }
 
+    @SuppressLint("ClickableViewAccessibility")
     private fun setupView(view: View, directory: Directory, holder: ViewHolder) {
         val isSelected = selectedKeys.contains(directory.path.hashCode())
         bindItem(view).apply {
@@ -928,6 +946,49 @@ class DirectoryAdapter(
         }
 
         notifyItemMoved(fromPosition, toPosition)
+    }
+
+    override fun onAttachedToRecyclerView(recyclerView: RecyclerView) {
+        super.onAttachedToRecyclerView(recyclerView)
+        directoryRecyclerView = recyclerView
+        prefetchDirectoryThumbnails()
+    }
+
+    override fun onDetachedFromRecyclerView(recyclerView: RecyclerView) {
+        super.onDetachedFromRecyclerView(recyclerView)
+        clearPrefetchRequests()
+        directoryRecyclerView = null
+    }
+
+    private fun clearPrefetchRequests() {
+        preloadTargets.forEach { Glide.with(context).clear(it) }
+        preloadTargets.clear()
+    }
+
+    private fun prefetchDirectoryThumbnails() {
+        val firstVisible = (directoryRecyclerView?.layoutManager as? LinearLayoutManager)
+            ?.findFirstVisibleItemPosition()?.takeIf { it != RecyclerView.NO_POSITION } ?: 0
+        val startIndex = maxOf(0, firstVisible - prefetchItemBudget / 4)
+        val endIndex = minOf(dirs.lastIndex, firstVisible + prefetchItemBudget)
+        var itemCount = 0
+        for (index in startIndex..endIndex) {
+            if (itemCount >= prefetchItemBudget) break
+            val dir = dirs[index]
+            if (lockedFolderPaths.contains(dir.path)) continue
+            val roundedCorners = when {
+                isListViewType -> ROUNDED_CORNERS_SMALL
+                folderStyle == FOLDER_STYLE_SQUARE -> ROUNDED_CORNERS_NONE
+                else -> ROUNDED_CORNERS_SMALL
+            }
+            val target = activity.preloadImageBase(
+                path = dir.tmb,
+                cropThumbnails = cropThumbnails,
+                roundCorners = roundedCorners,
+                signature = dir.getKey()
+            )
+            preloadTargets.add(target)
+            itemCount++
+        }
     }
 
     override fun onRowSelected(myViewHolder: ViewHolder?) {

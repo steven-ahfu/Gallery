@@ -121,13 +121,26 @@ class MediaSideScroll(context: Context, attrs: AttributeSet) : RelativeLayout(co
 
                     percentChanged(percent)
                 } else if (abs(diffX) > dragThreshold || abs(diffY) > dragThreshold) {
-                    if (!mPassTouches) {
-                        event.action = MotionEvent.ACTION_DOWN
-                        event.setLocation(event.rawX, event.rawY)
-                        mParentView?.dispatchTouchEvent(event)
+//                    if (!mPassTouches) {
+//                        event.action = MotionEvent.ACTION_DOWN
+//                        event.setLocation(event.rawX, event.rawY)
+//                        mParentView?.dispatchTouchEvent(event)
+//                    }
+//                    mPassTouches = true
+//                    mParentView?.dispatchTouchEvent(event)
+                    // Fix: Exception java.lang.NullPointerException: Attempt to read from field 'int android.view.View.mPrivateFlags' on a null object reference in method 'boolean android.view.ViewGroup.resetCancelNextUpFlag(android.view.View)'
+                    val parent = mParentView
+                    if (parent != null && parent.isAttachedToWindow) {
+                        if (!mPassTouches) {
+                            event.action = MotionEvent.ACTION_DOWN
+                            event.setLocation(event.rawX, event.rawY)
+                            parent.dispatchTouchEvent(event)
+                        }
+                        mPassTouches = true
+                        parent.dispatchTouchEvent(event)
+                    } else {
+                        mPassTouches = false
                     }
-                    mPassTouches = true
-                    mParentView?.dispatchTouchEvent(event)
                     return false
                 }
                 mLastTouchY = event.rawY
@@ -147,7 +160,7 @@ class MediaSideScroll(context: Context, attrs: AttributeSet) : RelativeLayout(co
     private fun getCurrentBrightness(): Int {
         return try {
             Settings.System.getInt(activity!!.contentResolver, Settings.System.SCREEN_BRIGHTNESS)
-        } catch (e: Settings.SettingNotFoundException) {
+        } catch (_: Settings.SettingNotFoundException) {
             70
         }
     }
@@ -161,11 +174,17 @@ class MediaSideScroll(context: Context, attrs: AttributeSet) : RelativeLayout(co
     }
 
     private fun volumePercentChanged(percent: Int) {
+        val activity = this.activity ?: return
+
         val stream = AudioManager.STREAM_MUSIC
-        val maxVolume = max(activity!!.audioManager.getStreamMaxVolume(stream), 1)
+        val maxVolume = try {
+            max(activity.audioManager.getStreamMaxVolume(stream), 1)
+        } catch (_: Exception) {
+            15
+        }
         val addPoints = ((percent / 100f) * maxVolume).toInt()
         val newVolume = (mTouchDownValue + addPoints).coerceIn(0, maxVolume)
-        activity!!.audioManager.setStreamVolume(stream, newVolume, 0)
+        activity.audioManager.setStreamVolume(stream, newVolume, 0)
 
         val absolutePercent = ((newVolume / maxVolume.toFloat()) * 100).toInt()
         showValue(absolutePercent)
@@ -177,17 +196,19 @@ class MediaSideScroll(context: Context, attrs: AttributeSet) : RelativeLayout(co
     }
 
     private fun brightnessPercentChanged(percent: Int) {
+        val activity = this.activity ?: return
+
         val maxBrightness = 255f
         var newBrightness = (mTouchDownValue + 2.55 * percent).toFloat()
-        newBrightness = Math.min(maxBrightness, Math.max(0f, newBrightness))
+        newBrightness = maxBrightness.coerceAtMost(0f.coerceAtLeast(newBrightness))
         mTempBrightness = newBrightness.toInt()
 
         val absolutePercent = ((newBrightness / maxBrightness) * 100).toInt()
         showValue(absolutePercent)
 
-        val attributes = activity!!.window.attributes
+        val attributes = activity.window.attributes
         attributes.screenBrightness = absolutePercent / 100f
-        activity!!.window.attributes = attributes
+        activity.window.attributes = attributes
 
         mSlideInfoFadeHandler.removeCallbacksAndMessages(null)
         mSlideInfoFadeHandler.postDelayed({
@@ -197,9 +218,21 @@ class MediaSideScroll(context: Context, attrs: AttributeSet) : RelativeLayout(co
 
     @SuppressLint("SetTextI18n")
     private fun showValue(percent: Int) {
+        // Checking for slideInfoView initialization
+        if (!this::slideInfoView.isInitialized) {
+            return
+        }
+
         slideInfoView.apply {
             text = "$mSlideInfoText:\n$percent%"
             alpha = 1f
         }
+    }
+
+    fun cleanup() {
+        mSlideInfoFadeHandler.removeCallbacksAndMessages(null)
+        activity = null
+        mParentView = null
+        mPassTouches = false
     }
 }

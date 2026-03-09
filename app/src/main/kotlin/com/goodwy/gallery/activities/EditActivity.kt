@@ -4,14 +4,13 @@ import android.annotation.SuppressLint
 import android.content.Intent
 import android.content.res.ColorStateList
 import android.graphics.Bitmap
-import android.graphics.Bitmap.CompressFormat
 import android.graphics.Color
 import android.graphics.Point
-import android.graphics.drawable.ColorDrawable
 import android.graphics.drawable.GradientDrawable
 import android.net.Uri
 import android.os.Bundle
 import android.os.Handler
+import android.os.Looper
 import android.provider.MediaStore
 import android.view.View
 import android.widget.ImageView
@@ -42,7 +41,14 @@ import com.goodwy.gallery.dialogs.OtherAspectRatioDialog
 import com.goodwy.gallery.dialogs.ResizeDialog
 import com.goodwy.gallery.dialogs.SaveAsDialog
 import com.goodwy.gallery.extensions.config
-import com.goodwy.gallery.extensions.copyNonDimensionAttributesTo
+import com.goodwy.gallery.extensions.writeExif
+import com.goodwy.gallery.extensions.ensureWritablePath
+import com.goodwy.gallery.extensions.getCompressionFormatFromUri
+import com.goodwy.gallery.extensions.readExif
+import com.goodwy.gallery.extensions.proposeNewFilePath
+import com.goodwy.gallery.extensions.resolveUriScheme
+import com.goodwy.gallery.extensions.showContentDescriptionOnLongClick
+import com.goodwy.gallery.extensions.writeBitmapToCache
 import com.goodwy.gallery.extensions.fixDateTaken
 import com.goodwy.gallery.extensions.openEditor
 import com.goodwy.gallery.helpers.*
@@ -55,6 +61,9 @@ import kotlin.math.max
 import kotlinx.coroutines.*
 import androidx.core.graphics.scale
 import androidx.core.net.toUri
+import androidx.core.graphics.drawable.toDrawable
+import com.goodwy.gallery.extensions.readExif
+import com.goodwy.gallery.extensions.showContentDescriptionOnLongClick
 
 class EditActivity : SimpleActivity(), CanvasListener {
     companion object {
@@ -62,7 +71,6 @@ class EditActivity : SimpleActivity(), CanvasListener {
             System.loadLibrary("NativeImageProcessor")
         }
 
-        private const val TEMP_FOLDER_NAME = "images"
         private const val ASPECT_X = "aspectX"
         private const val ASPECT_Y = "aspectY"
         private const val CROP = "crop"
@@ -99,12 +107,14 @@ class EditActivity : SimpleActivity(), CanvasListener {
     private var isEyeDropperOn = false
     private val binding by viewBinding(ActivityEditBinding::inflate)
 
+    private var overwriteRequested = false
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         setContentView(binding.root)
 
 //        if (config.blackBackground) {
-            binding.editorCoordinator.background = ColorDrawable(Color.BLACK) //TODO always black background
+            binding.editorCoordinator.background = Color.BLACK.toDrawable() //TODO always black background
 //        }
         binding.editorDrawCanvas.mListener = this
         //binding.editorDrawCanvas.updateBackgroundColor(resources.getColor(R.color.theme_black_background_color)) //TODO For Eraser
@@ -161,7 +171,8 @@ class EditActivity : SimpleActivity(), CanvasListener {
             when (menuItem.itemId) {
                 R.id.undo -> binding.editorDrawCanvas.undo()
                 R.id.redo -> binding.editorDrawCanvas.redo()
-                R.id.save_as -> saveImage()
+                R.id.save_as -> startSaveFlow(overwrite = false)
+                R.id.overwrite_original -> startSaveFlow(overwrite = true)
                 R.id.edit -> editWith()
                 R.id.share -> shareImage()
                 else -> return@setOnMenuItemClickListener false
@@ -175,6 +186,7 @@ class EditActivity : SimpleActivity(), CanvasListener {
             findItem(R.id.undo).isVisible = binding.editorDrawCanvas.isVisible()
             findItem(R.id.redo).isVisible = binding.editorDrawCanvas.isVisible()
             findItem(R.id.save_as).isVisible = isCropIntent
+            findItem(R.id.overwrite_original).isVisible = !isCropIntent && !binding.defaultImageView.isVisible()
         }
     }
 
@@ -193,11 +205,12 @@ class EditActivity : SimpleActivity(), CanvasListener {
             return
         }
 
-        if (intent.extras?.containsKey(REAL_FILE_PATH) == true) {
+        val extras = intent.extras
+        if (extras?.containsKey(REAL_FILE_PATH) == true) {
             val realPath = intent.extras!!.getString(REAL_FILE_PATH)
             uri = when {
                 isPathOnOTG(realPath!!) -> uri
-                realPath.startsWith("file:/") -> Uri.parse(realPath)
+                realPath.startsWith("file:/") -> realPath.toUri()
                 else -> Uri.fromFile(File(realPath))
             }
         } else {
@@ -207,14 +220,16 @@ class EditActivity : SimpleActivity(), CanvasListener {
         }
 
         saveUri = when {
-            intent.extras?.containsKey(MediaStore.EXTRA_OUTPUT) == true && intent.extras!!.get(MediaStore.EXTRA_OUTPUT) is Uri -> intent.extras!!.get(MediaStore.EXTRA_OUTPUT) as Uri
+            extras?.containsKey(MediaStore.EXTRA_OUTPUT) == true
+                && extras.get(MediaStore.EXTRA_OUTPUT) is Uri -> extras.get(MediaStore.EXTRA_OUTPUT) as Uri
             else -> uri!!
         }
 
-        isCropIntent = intent.extras?.get(CROP) == "true"
+        isCropIntent = extras?.get(CROP) == "true"
         if (isCropIntent) {
             binding.bottomEditorPrimaryActions.root.beGone()
             (binding.bottomEditorCropRotateActions.root.layoutParams as RelativeLayout.LayoutParams).addRule(RelativeLayout.ALIGN_PARENT_BOTTOM, 1)
+            binding.editorToolbar.menu.findItem(R.id.overwrite_original).isVisible = false
         }
 
         loadDefaultImageView()
@@ -236,7 +251,32 @@ class EditActivity : SimpleActivity(), CanvasListener {
         binding.bottomAspectRatios.root.beVisible()
     }
 
+    private fun isUriValid(uri: Uri?): Boolean {
+        if (uri == null) return false
+
+        return try {
+            when (uri.scheme) {
+                "file" -> {
+                    val file = File(uri.path ?: "")
+                    file.exists() && file.isFile && file.length() > 0
+                }
+                "content" -> {
+                    contentResolver.openInputStream(uri)?.use { true } ?: false
+                }
+                else -> false
+            }
+        } catch (e: Exception) {
+            false
+        }
+    }
+
     private fun loadDefaultImageView() {
+        if (!isUriValid(uri)) {
+            showErrorToast(getString(R.string.invalid_image_path))
+            finish()
+            return
+        }
+
         binding.defaultImageView.beVisible()
         binding.cropImageView.beGone()
         binding.editorDrawCanvas.beGone()
@@ -255,9 +295,10 @@ class EditActivity : SimpleActivity(), CanvasListener {
                     ColorModeHelper.resetColorMode(this@EditActivity)
                     if (uri != originalUri) {
                         uri = originalUri
-                        Handler().post {
+                        // Fix: java.lang.IllegalStateException Exception O3.c: Unexpected exception thrown by non-Glide code
+                        Handler(Looper.getMainLooper()).postDelayed({
                             loadDefaultImageView()
-                        }
+                        }, 100)
                     }
                     return false
                 }
@@ -340,6 +381,13 @@ class EditActivity : SimpleActivity(), CanvasListener {
             .fitCenter()
 
         try {
+            if (!isUriValid(uri)) {
+                runOnUiThread {
+                    showErrorToast(getString(R.string.failed_to_load_image_for_drawing))
+                }
+                return
+            }
+
             val builder = Glide.with(applicationContext)
                 .asBitmap()
                 .load(uri)
@@ -358,79 +406,116 @@ class EditActivity : SimpleActivity(), CanvasListener {
             }
         } catch (e: Exception) {
             showErrorToast(e)
-        }
-    }
-
-    private fun saveImage() {
-        setOldExif()
-
-        if (binding.cropImageView.isVisible()) {
-            cropImageAsync()
-        } else if (binding.editorDrawCanvas.isVisible()) {
-            val bitmap = binding.editorDrawCanvas.getBitmap()
-            if (saveUri.scheme == "file") {
-                SaveAsDialog(this, saveUri.path!!, true) {
-                    saveBitmapToFile(bitmap, it, true)
-                }
-            } else if (saveUri.scheme == "content") {
-                val filePathGetter = getNewFilePath()
-                SaveAsDialog(this, filePathGetter.first, filePathGetter.second) {
-                    saveBitmapToFile(bitmap, it, true)
-                }
+            runOnUiThread {
+                showErrorToast(getString(R.string.failed_to_load_image_for_drawing))
             }
-        } else {
-            val currentFilter = getFiltersAdapter()?.getCurrentFilter() ?: return
-            val filePathGetter = getNewFilePath()
-            SaveAsDialog(this, filePathGetter.first, filePathGetter.second) {
-                toast(com.goodwy.commons.R.string.saving)
-
-                // clean up everything to free as much memory as possible
-                binding.defaultImageView.setImageResource(0)
-                binding.cropImageView.setImageBitmap(null)
-                binding.bottomEditorFilterActions.bottomActionsFilterList.adapter = null
-                binding.bottomEditorFilterActions.bottomActionsFilterList.beGone()
-
-                ensureBackgroundThread {
-                    try {
-                        val originalBitmap = Glide.with(applicationContext).asBitmap().load(uri).submit(Target.SIZE_ORIGINAL, Target.SIZE_ORIGINAL).get()
-                        currentFilter.filter.processFilter(originalBitmap)
-                        saveBitmapToFile(originalBitmap, it, false)
-                    } catch (e: OutOfMemoryError) {
-                        toast(com.goodwy.commons.R.string.out_of_memory_error)
-                    }
-                }
-            }
-        }
-    }
-
-    private fun setCropProgressBarVisibility(visible: Boolean) {
-        val progressBar: View? = binding.cropImageView.findViewById(com.canhub.cropper.R.id.CropProgressBar)
-        progressBar?.isInvisible = visible.not()
-    }
-
-    private fun cropImageAsync() {
-        setCropProgressBarVisibility(visible = true)
-        bitmapCroppingJob?.cancel()
-        bitmapCroppingJob = lifecycleScope.launch(CoroutineExceptionHandler { _, t ->
-            onCropImageComplete(bitmap = null, error = Exception(t))
-        }) {
-            val bitmap = withContext(Dispatchers.Default) {
-                binding.cropImageView.getCroppedImage()
-            }
-            onCropImageComplete(bitmap, null)
-        }.apply {
-            invokeOnCompletion { setCropProgressBarVisibility(visible = false) }
         }
     }
 
     private fun setOldExif() {
-        var inputStream: InputStream? = null
-        try {
-            inputStream = contentResolver.openInputStream(uri!!)
-            oldExif = ExifInterface(inputStream!!)
-       } catch (e: Exception) {
-        } finally {
-            inputStream?.close()
+        oldExif = readExif(uri!!)
+    }
+
+    private fun startSaveFlow(overwrite: Boolean) {
+        overwriteRequested = overwrite
+        setOldExif()
+        when {
+            binding.cropImageView.isVisible() -> saveCroppedImage()
+            binding.editorDrawCanvas.isVisible() -> saveDrawnImage()
+            else -> saveFilteredImage(overwrite)
+        }
+    }
+
+    private fun saveDrawnImage() {
+        saveBitmap(
+            overwrite = overwriteRequested,
+            bitmap = binding.editorDrawCanvas.getBitmap()
+        )
+    }
+
+    private fun setCropProgressBarVisibility(visible: Boolean) {
+        binding.cropImageView
+            .findViewById<View>(com.canhub.cropper.R.id.CropProgressBar)
+            ?.isInvisible = visible.not()
+    }
+
+    private fun saveCroppedImage() {
+        setCropProgressBarVisibility(true)
+        bitmapCroppingJob?.cancel()
+        bitmapCroppingJob = lifecycleScope.launch(CoroutineExceptionHandler { _, t ->
+            onImageCropped(bitmap = null, error = Exception(t))
+        }) {
+            val bitmap = withContext(Dispatchers.Default) {
+                binding.cropImageView.getCroppedImage()
+            }
+            onImageCropped(bitmap, null)
+        }.apply {
+            invokeOnCompletion { setCropProgressBarVisibility(false) }
+        }
+    }
+
+    private fun onImageCropped(bitmap: Bitmap?, error: Exception?) {
+        if (error != null || bitmap == null) {
+            toast("${getString(R.string.image_editing_failed)}: ${error?.message}")
+            return
+        }
+
+        setOldExif()
+
+        if (isSharingBitmap) {
+            isSharingBitmap = false
+            shareBitmap(bitmap)
+            return
+        }
+
+        if (isCropIntent) {
+            resolveUriScheme(
+                uri = saveUri,
+                onPath = { saveBitmapToPath(bitmap, it, true) },
+                onContentUri = {
+                    saveBitmapToContentUri(bitmap, it, showSavingToast = true, isCropCommit = true)
+                }
+            )
+            return
+        }
+
+        saveBitmap(overwriteRequested, bitmap, showSavingToast = true)
+    }
+
+    private fun getOriginalBitmap(): Bitmap {
+        return Glide.with(applicationContext)
+            .asBitmap()
+            .load(uri)
+            .submit(Target.SIZE_ORIGINAL, Target.SIZE_ORIGINAL)
+            .get()
+    }
+
+    private fun withFilteredImage(callback: (Bitmap) -> Unit) {
+        val currentFilter = getFiltersAdapter()?.getCurrentFilter() ?: return
+        ensureBackgroundThread {
+            try {
+                val original = getOriginalBitmap()
+                currentFilter.filter.processFilter(original)
+                callback(original)
+            } catch (_: OutOfMemoryError) {
+                toast(com.goodwy.commons.R.string.out_of_memory_error)
+            }
+        }
+    }
+
+    private fun saveFilteredImage(overwrite: Boolean) {
+        if (overwrite) {
+            freeMemory()
+            withFilteredImage {
+                saveBitmap(true, it)
+            }
+        } else {
+            resolveSaveAsPath { path ->
+                freeMemory()
+                withFilteredImage {
+                    saveBitmapToPath(it, path, showSavingToast = true)
+                }
+            }
         }
     }
 
@@ -444,7 +529,7 @@ class EditActivity : SimpleActivity(), CanvasListener {
                         return@ensureBackgroundThread
                     }
 
-                    val originalBitmap = Glide.with(applicationContext).asBitmap().load(uri).submit(Target.SIZE_ORIGINAL, Target.SIZE_ORIGINAL).get()
+                    val originalBitmap = getOriginalBitmap()
                     currentFilter.filter.processFilter(originalBitmap)
                     shareBitmap(originalBitmap)
                 }
@@ -452,7 +537,7 @@ class EditActivity : SimpleActivity(), CanvasListener {
                 binding.cropImageView.isVisible() -> {
                     isSharingBitmap = true
                     runOnUiThread {
-                        cropImageAsync()
+                        saveCroppedImage()
                     }
                 }
 
@@ -461,38 +546,8 @@ class EditActivity : SimpleActivity(), CanvasListener {
         }
     }
 
-    private fun getTempImagePath(bitmap: Bitmap, callback: (path: String?) -> Unit) {
-        val bytes = ByteArrayOutputStream()
-        bitmap.compress(CompressFormat.PNG, 0, bytes)
-
-        val folder = File(cacheDir, TEMP_FOLDER_NAME)
-        if (!folder.exists()) {
-            if (!folder.mkdir()) {
-                callback(null)
-                return
-            }
-        }
-
-        val filename = applicationContext.getFilenameFromContentUri(saveUri) ?: "tmp-${System.currentTimeMillis()}.jpg"
-        val newPath = "$folder/$filename"
-        val fileDirItem = FileDirItem(newPath, filename)
-        getFileOutputStream(fileDirItem, true) {
-            if (it != null) {
-                try {
-                    it.write(bytes.toByteArray())
-                    callback(newPath)
-                } catch (e: Exception) {
-                } finally {
-                    it.close()
-                }
-            } else {
-                callback("")
-            }
-        }
-    }
-
     private fun shareBitmap(bitmap: Bitmap) {
-        getTempImagePath(bitmap) {
+        writeBitmapToCache(saveUri, bitmap) {
             if (it != null) {
                 sharePathIntent(it, BuildConfig.APPLICATION_ID)
             } else {
@@ -501,7 +556,9 @@ class EditActivity : SimpleActivity(), CanvasListener {
         }
     }
 
-    private fun getFiltersAdapter() = binding.bottomEditorFilterActions.bottomActionsFilterList.adapter as? FiltersAdapter
+    private fun getFiltersAdapter(): FiltersAdapter? {
+        return binding.bottomEditorFilterActions.bottomActionsFilterList.adapter as? FiltersAdapter
+    }
 
     private fun setupBottomActions() {
         setupPrimaryActionButtons()
@@ -528,7 +585,7 @@ class EditActivity : SimpleActivity(), CanvasListener {
         }
 
         binding.bottomEditorPrimaryActions.bottomPrimarySave.setOnClickListener {
-            saveImage()
+            startSaveFlow(overwrite = false)
         }
 
         arrayOf(
@@ -536,7 +593,7 @@ class EditActivity : SimpleActivity(), CanvasListener {
             binding.bottomEditorPrimaryActions.bottomPrimaryCropRotate,
             binding.bottomEditorPrimaryActions.bottomPrimaryDraw
         ).forEach {
-            setupLongPress(it)
+            it.showContentDescriptionOnLongClick()
         }
     }
 
@@ -605,7 +662,7 @@ class EditActivity : SimpleActivity(), CanvasListener {
             binding.bottomEditorCropRotateActions.bottomFlipVertically,
             binding.bottomEditorCropRotateActions.bottomAspectRatio
         ).forEach {
-            setupLongPress(it)
+            it.showContentDescriptionOnLongClick()
         }
     }
 
@@ -715,59 +772,67 @@ class EditActivity : SimpleActivity(), CanvasListener {
 
         if (currPrimaryAction == PRIMARY_ACTION_FILTER && binding.bottomEditorFilterActions.bottomActionsFilterList.adapter == null) {
             ensureBackgroundThread {
-                val thumbnailSize = resources.getDimension(R.dimen.bottom_filters_thumbnail_size).toInt()
+                try {
+                    val thumbnailSize = resources.getDimension(R.dimen.bottom_filters_thumbnail_size).toInt()
 
-                val bitmap = try {
-                    Glide.with(this)
-                        .asBitmap()
-                        .load(uri).listener(object : RequestListener<Bitmap> {
-                            override fun onLoadFailed(e: GlideException?, model: Any?, target: Target<Bitmap>, isFirstResource: Boolean): Boolean {
-                                showErrorToast(e.toString())
-                                return false
+                    val bitmap = try {
+                        Glide.with(this)
+                            .asBitmap()
+                            .load(uri)
+                            .listener(object : RequestListener<Bitmap> {
+                                override fun onLoadFailed(e: GlideException?, model: Any?, target: Target<Bitmap>, isFirstResource: Boolean): Boolean {
+                                    showErrorToast(e?.toString() ?: "Failed to load image")
+                                    return false
+                                }
+
+                                override fun onResourceReady(
+                                    resource: Bitmap,
+                                    model: Any,
+                                    target: Target<Bitmap>,
+                                    dataSource: DataSource,
+                                    isFirstResource: Boolean
+                                ) = false
+                            })
+                            .submit(thumbnailSize, thumbnailSize)
+                            .get()
+                    } catch (e: Exception) {
+                        // Если не удалось загрузить уменьшенное изображение, попробуем загрузить оригинальное
+                        try {
+                            Glide.with(this)
+                                .asBitmap()
+                                .load(uri)
+                                .submit()
+                                .get()
+                                .scale(thumbnailSize, thumbnailSize, true)
+                        } catch (e2: Exception) {
+                            runOnUiThread {
+                                showErrorToast(getString(R.string.failed_to_load_image_for_filters))
+                                currPrimaryAction = PRIMARY_ACTION_NONE
+                                updatePrimaryActionButtons()
                             }
-
-                            override fun onResourceReady(
-                                resource: Bitmap,
-                                model: Any,
-                                target: Target<Bitmap>,
-                                dataSource: DataSource,
-                                isFirstResource: Boolean
-                            ) = false
-                        })
-                        .submit(thumbnailSize, thumbnailSize)
-                        .get()
-                } catch (e: GlideException) {
-                    showErrorToast(e)
-                    finish()
-                    return@ensureBackgroundThread
-                }
-
-                runOnUiThread {
-                    val filterThumbnailsManager = FilterThumbnailsManager()
-                    filterThumbnailsManager.clearThumbs()
-
-                    val noFilter = Filter(getString(com.goodwy.commons.R.string.none))
-                    filterThumbnailsManager.addThumb(FilterItem(bitmap, noFilter))
-
-                    FilterPack.getFilterPack(this).forEach {
-                        val filterItem = FilterItem(bitmap, it)
-                        filterThumbnailsManager.addThumb(filterItem)
-                    }
-
-                    val filterItems = filterThumbnailsManager.processThumbs()
-                    val adapter = FiltersAdapter(applicationContext, filterItems) {
-                        val layoutManager = binding.bottomEditorFilterActions.bottomActionsFilterList.layoutManager as LinearLayoutManager
-                        applyFilter(filterItems[it])
-
-                        if (it == layoutManager.findLastCompletelyVisibleItemPosition() || it == layoutManager.findLastVisibleItemPosition()) {
-                            binding.bottomEditorFilterActions.bottomActionsFilterList.smoothScrollBy(thumbnailSize, 0)
-                        } else if (it == layoutManager.findFirstCompletelyVisibleItemPosition() || it == layoutManager.findFirstVisibleItemPosition()) {
-                            binding.bottomEditorFilterActions.bottomActionsFilterList.smoothScrollBy(-thumbnailSize, 0)
+                            return@ensureBackgroundThread
                         }
                     }
 
-                    binding.bottomEditorFilterActions.bottomActionsFilterList.adapter = adapter
-                    adapter.notifyDataSetChanged()
+                    // Проверяем, что bitmap валиден
+                    if (bitmap.isRecycled || bitmap.width <= 0 || bitmap.height <= 0) {
+                        runOnUiThread {
+                            showErrorToast(getString(R.string.invalid_image_for_filters))
+                            currPrimaryAction = PRIMARY_ACTION_NONE
+                            updatePrimaryActionButtons()
+                        }
+                        return@ensureBackgroundThread
+                    }
+
+                    runOnUiThread {
+                        setupFiltersAdapter(bitmap)
+                    }
+                } catch (e: Exception) {
+                    runOnUiThread {
+                        showErrorToast("${getString(R.string.failed_to_load_filters)}: ${e.message}")
+                        currPrimaryAction = PRIMARY_ACTION_NONE
+                        updatePrimaryActionButtons()
+                    }
                 }
             }
         }
@@ -777,6 +842,36 @@ class EditActivity : SimpleActivity(), CanvasListener {
             currCropRotateAction = CROP_ROTATE_NONE
         }
         updateCropRotateActionButtons()
+    }
+
+    private fun setupFiltersAdapter(bitmap: Bitmap) {
+        val filterThumbnailsManager = FilterThumbnailsManager()
+        filterThumbnailsManager.clearThumbs()
+
+        val noFilter = Filter(getString(com.goodwy.commons.R.string.none))
+        filterThumbnailsManager.addThumb(FilterItem(bitmap, noFilter))
+
+        FilterPack.getFilterPack(this).forEach {
+            val filterItem = FilterItem(bitmap, it)
+            filterThumbnailsManager.addThumb(filterItem)
+        }
+
+        val filterItems = filterThumbnailsManager.processThumbs()
+        val adapter = FiltersAdapter(applicationContext, filterItems) {
+            val layoutManager = binding.bottomEditorFilterActions.bottomActionsFilterList.layoutManager as LinearLayoutManager
+            applyFilter(filterItems[it])
+
+            if (it == layoutManager.findLastCompletelyVisibleItemPosition() || it == layoutManager.findLastVisibleItemPosition()) {
+                val thumbnailSize = resources.getDimension(R.dimen.bottom_filters_thumbnail_size).toInt()
+                binding.bottomEditorFilterActions.bottomActionsFilterList.smoothScrollBy(thumbnailSize, 0)
+            } else if (it == layoutManager.findFirstCompletelyVisibleItemPosition() || it == layoutManager.findFirstVisibleItemPosition()) {
+                val thumbnailSize = resources.getDimension(R.dimen.bottom_filters_thumbnail_size).toInt()
+                binding.bottomEditorFilterActions.bottomActionsFilterList.smoothScrollBy(-thumbnailSize, 0)
+            }
+        }
+
+        binding.bottomEditorFilterActions.bottomActionsFilterList.adapter = adapter
+        adapter.notifyDataSetChanged()
     }
 
     private fun applyFilter(filterItem: FilterItem) {
@@ -864,19 +959,14 @@ class EditActivity : SimpleActivity(), CanvasListener {
         ResizeDialog(this, point) {
             resizeWidth = it.x
             resizeHeight = it.y
-            cropImageAsync()
+            saveCroppedImage()
         }
     }
 
     private fun shouldCropSquare(): Boolean {
         val extras = intent.extras
-        return if (extras != null && extras.containsKey(ASPECT_X) && extras.containsKey(
-                ASPECT_Y
-            )
-        ) {
-            extras.getInt(ASPECT_X) == extras.getInt(
-                ASPECT_Y
-            )
+        return if (extras != null && extras.containsKey(ASPECT_X) && extras.containsKey(ASPECT_Y)) {
+            extras.getInt(ASPECT_X) == extras.getInt(ASPECT_Y)
         } else {
             false
         }
@@ -892,87 +982,59 @@ class EditActivity : SimpleActivity(), CanvasListener {
         }
     }
 
-    private fun onCropImageComplete(bitmap: Bitmap?, error: Exception?) {
-        if (error == null && bitmap != null) {
-            setOldExif()
+    private fun resolveSaveAsPath(callback: (String) -> Unit) {
+        runOnUiThread {
+            resolveUriScheme(
+                uri = saveUri,
+                onPath = {
+                    SaveAsDialog(this, it, true, callback = callback)
+                },
+                onContentUri = {
+                    val (path, append) = proposeNewFilePath(it)
+                    SaveAsDialog(this, path, append, callback = callback)
+                }
+            )
+        }
+    }
 
-            if (isSharingBitmap) {
-                isSharingBitmap = false
-                shareBitmap(bitmap)
-                return
-            }
-
-            if (isCropIntent) {
-                if (saveUri.scheme == "file") {
-                    saveBitmapToFile(bitmap, saveUri.path!!, true)
-                } else {
-                    var inputStream: InputStream? = null
-                    var outputStream: OutputStream? = null
-                    try {
-                        val stream = ByteArrayOutputStream()
-                        bitmap.compress(CompressFormat.JPEG, 100, stream)
-                        inputStream = ByteArrayInputStream(stream.toByteArray())
-                        outputStream = contentResolver.openOutputStream(saveUri)
-                        inputStream.copyTo(outputStream!!)
-                    } catch (e: Exception) {
-                        showErrorToast(e)
-                        return
-                    } finally {
-                        inputStream?.close()
-                        outputStream?.close()
+    private fun saveBitmap(overwrite: Boolean, bitmap: Bitmap, showSavingToast: Boolean = true) {
+        if (overwrite) {
+            resolveUriScheme(
+                uri = saveUri,
+                onPath = { path ->
+                    ensureWritablePath(targetPath = path, confirmOverwrite = false) {
+                        saveBitmapToPath(bitmap, it, showSavingToast)
                     }
-
-                    copyExifToUri(oldExif, saveUri)
-                    Intent().apply {
-                        data = saveUri
-                        addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
-                        setResult(RESULT_OK, this)
-                    }
-                    finish()
+                },
+                onContentUri = { contentUri ->
+                    saveBitmapToContentUri(bitmap, contentUri, showSavingToast, isCropCommit = false)
                 }
-            } else if (saveUri.scheme == "file") {
-                SaveAsDialog(this, saveUri.path!!, true) {
-                    saveBitmapToFile(bitmap, it, true)
-                }
-            } else if (saveUri.scheme == "content") {
-                val filePathGetter = getNewFilePath()
-                SaveAsDialog(this, filePathGetter.first, filePathGetter.second) {
-                    saveBitmapToFile(bitmap, it, true)
-                }
-            } else {
-                toast(R.string.unknown_file_location)
-            }
+            )
         } else {
-            toast("${getString(R.string.image_editing_failed)}: ${error?.message}")
-        }
-    }
-
-    private fun getNewFilePath(): Pair<String, Boolean> {
-        var newPath = applicationContext.getRealPathFromURI(saveUri) ?: ""
-        if (newPath.startsWith("/mnt/")) {
-            newPath = ""
-        }
-
-        var shouldAppendFilename = true
-        if (newPath.isEmpty()) {
-            val filename = applicationContext.getFilenameFromContentUri(saveUri) ?: ""
-            if (filename.isNotEmpty()) {
-                val path =
-                    if (intent.extras?.containsKey(REAL_FILE_PATH) == true) intent.getStringExtra(REAL_FILE_PATH)?.getParentPath() else internalStoragePath
-                newPath = "$path/$filename"
-                shouldAppendFilename = false
+            resolveSaveAsPath { path ->
+                saveBitmapToPath(bitmap, path, showSavingToast)
             }
         }
-
-        if (newPath.isEmpty()) {
-            newPath = "$internalStoragePath/${getCurrentFormattedDateTime()}.${saveUri.toString().getFilenameExtension()}"
-            shouldAppendFilename = false
-        }
-
-        return Pair(newPath, shouldAppendFilename)
     }
 
-    private fun saveBitmapToFile(bitmap: Bitmap, path: String, showSavingToast: Boolean) {
+    private fun finishCropResultForContent(uri: Uri) {
+        val result = Intent().apply {
+            data = uri
+            addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+        }
+        setResult(RESULT_OK, result)
+        finish()
+    }
+
+    private fun freeMemory() {
+        // clean up everything to free as much memory as possible
+        binding.defaultImageView.setImageResource(0)
+        binding.cropImageView.setImageBitmap(null)
+        binding.bottomEditorFilterActions.bottomActionsFilterList.adapter = null
+        binding.bottomEditorFilterActions.bottomActionsFilterList.beGone()
+    }
+
+    private fun saveBitmapToPath(bitmap: Bitmap, path: String, showSavingToast: Boolean) {
         if (!packageName.contains("ywdoog".reversed(), true)) {
             if (baseConfig.appRunCount > 100) {
                 val label =
@@ -992,11 +1054,11 @@ class EditActivity : SimpleActivity(), CanvasListener {
                 val fileDirItem = FileDirItem(path, path.getFilenameFromPath())
                 try {
                     val out = FileOutputStream(file)
-                    saveBitmap(file, bitmap, out, showSavingToast)
+                    saveBitmapToFile(file, bitmap, out, showSavingToast)
                 } catch (e: Exception) {
                     getFileOutputStream(fileDirItem, true) {
                         if (it != null) {
-                            saveBitmap(file, bitmap, it, showSavingToast)
+                            saveBitmapToFile(file, bitmap, it, showSavingToast)
                         } else {
                             toast(R.string.image_editing_failed)
                         }
@@ -1010,7 +1072,7 @@ class EditActivity : SimpleActivity(), CanvasListener {
         }
     }
 
-    private fun saveBitmap(file: File, bitmap: Bitmap, out: OutputStream, showSavingToast: Boolean) {
+    private fun saveBitmapToFile(file: File, bitmap: Bitmap, out: OutputStream, showSavingToast: Boolean) {
         if (showSavingToast) {
             toast(com.goodwy.commons.R.string.saving)
         }
@@ -1024,22 +1086,55 @@ class EditActivity : SimpleActivity(), CanvasListener {
             }
         }
 
-        copyExifToUri(oldExif, file.toUri())
+        writeExif(oldExif, file.toUri())
         setResult(RESULT_OK, intent)
         scanFinalPath(file.absolutePath)
     }
 
-    private fun copyExifToUri(source: ExifInterface?, destination: Uri?) {
-        if (source == null || destination == null) return
-        if (destination.scheme == "content") {
-            contentResolver.openFileDescriptor(destination, "rw")?.use { pfd ->
-                val destExif = ExifInterface(pfd.fileDescriptor)
-                source.copyNonDimensionAttributesTo(destExif)
+    private fun saveBitmapToContentUri(
+        bitmap: Bitmap,
+        uri: Uri,
+        showSavingToast: Boolean,
+        isCropCommit: Boolean
+    ) {
+        if (showSavingToast) {
+            toast(com.goodwy.commons.R.string.saving)
+        }
+
+        ensureBackgroundThread {
+            var out: OutputStream? = null
+            try {
+                out = contentResolver.openOutputStream(uri, "wt")
+                    ?: contentResolver.openOutputStream(uri)
+                if (out == null) {
+                    val (path, append) = proposeNewFilePath(uri)
+                    runOnUiThread {
+                        SaveAsDialog(this, path, append) { path ->
+                            saveBitmapToPath(bitmap, path, showSavingToast)
+                        }
+                    }
+                    return@ensureBackgroundThread
+                }
+
+                val quality = if (isCropCommit) 100 else 90
+                bitmap.compress(getCompressionFormatFromUri(uri), quality, out)
+                out.flush()
+                writeExif(oldExif, uri)
+
+                runOnUiThread {
+                    if (isCropCommit) {
+                        finishCropResultForContent(uri)
+                    } else {
+                        setResult(RESULT_OK, intent)
+                        toast(com.goodwy.commons.R.string.file_saved)
+                        finish()
+                    }
+                }
+            } catch (e: Exception) {
+                showErrorToast(e)
+            } finally {
+                try { out?.close() } catch (_: Exception) {}
             }
-        } else {
-            val file = File(destination.path!!)
-            val destExif = ExifInterface(file.absolutePath)
-            source.copyNonDimensionAttributesTo(destExif)
         }
     }
 
@@ -1058,15 +1153,6 @@ class EditActivity : SimpleActivity(), CanvasListener {
         }
     }
 
-    private fun setupLongPress(view: ImageView) {
-        view.setOnLongClickListener {
-            val contentDescription = view.contentDescription
-            if (contentDescription != null) {
-                toast(contentDescription.toString())
-            }
-            true
-        }
-    }
     override fun toggleUndoVisibility(visible: Boolean) {
         //bottom_draw_undo.beVisibleIf(visible)
         binding.editorToolbar.menu.findItem(R.id.undo).isEnabled = visible

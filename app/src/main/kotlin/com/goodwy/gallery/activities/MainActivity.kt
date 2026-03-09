@@ -9,6 +9,7 @@ import android.os.Handler
 import android.provider.MediaStore
 import android.provider.MediaStore.Images
 import android.provider.MediaStore.Video
+import android.speech.RecognizerIntent
 import android.view.ViewGroup
 import android.widget.RelativeLayout
 import android.widget.Toast
@@ -43,6 +44,7 @@ import java.io.FileInputStream
 import java.io.FileNotFoundException
 import java.io.InputStream
 import java.io.OutputStream
+import java.util.Objects
 
 class MainActivity : SimpleActivity(), DirectoryOperationsListener {
     companion object {
@@ -89,6 +91,7 @@ class MainActivity : SimpleActivity(), DirectoryOperationsListener {
     private var mStoredPrimaryColor = 0
     private var mStoredStyleString = ""
     private var mStoredHideTopBarWhenScroll = false
+    private var isSpeechToTextAvailable = false
 
     private val binding by viewBinding(ActivityMainBinding::inflate)
 
@@ -134,7 +137,14 @@ class MainActivity : SimpleActivity(), DirectoryOperationsListener {
             useTransparentNavigation = true, //!config.scrollHorizontally,
             useTopSearchMenu = true
         )
-        if (config.changeColourTopBar) setupSearchMenuScrollListener(binding.directoriesGrid, binding.mainMenu)
+        if (config.changeColourTopBar) {
+            val useSurfaceColor = isDynamicTheme() && !isSystemInDarkMode()
+            setupSearchMenuScrollListener(
+                scrollingView = binding.directoriesGrid,
+                searchMenu = binding.mainMenu,
+                surfaceColor = useSurfaceColor
+            )
+        }
 
         binding.directoriesRefreshLayout.setOnRefreshListener { getDirectories() }
         storeStateVariables()
@@ -200,7 +210,9 @@ class MainActivity : SimpleActivity(), DirectoryOperationsListener {
                     val topPadding = resources.getDimension(com.goodwy.commons.R.dimen.small_margin).toInt()
                     binding.directoriesGrid.setPadding(0, topPadding, 0, bottomNavigationBarSize) // needed clipToPadding="false"
                 }
-                updateNavigationBarColor(getProperBackgroundColor())
+//                val useSurfaceColor = isDynamicTheme() && !isSystemInDarkMode()
+//                val backgroundColor = if (useSurfaceColor) getSurfaceColor() else getProperBackgroundColor()
+//                updateNavigationBarColor(backgroundColor)
             }
         }
     }
@@ -220,7 +232,7 @@ class MainActivity : SimpleActivity(), DirectoryOperationsListener {
 
         refreshMenuItems()
 
-        if (config.tabsChanged || mStoredHideTopBarWhenScroll != config.hideTopBarWhenScroll) {
+        if (config.needRestart || mStoredHideTopBarWhenScroll != config.hideTopBarWhenScroll) {
             finish()
             startActivity(intent)
             return
@@ -258,7 +270,12 @@ class MainActivity : SimpleActivity(), DirectoryOperationsListener {
             setupAdapter(mDirs, forceRecreate = true)
         }
 
-        binding.directoriesFastscroller.updateColors(primaryColor)
+        if (isDynamicTheme() && !isSystemInDarkMode()) {
+            binding.directoriesGrid.setBackgroundColor(getSurfaceColor())
+        }
+
+        val accentColor = getProperAccentColor()
+        binding.directoriesFastscroller.updateColors(accentColor)
         binding.directoriesRefreshLayout.isEnabled = config.enablePullToRefresh
         getRecyclerAdapter()?.apply {
             dateFormat = config.dateFormat
@@ -371,6 +388,16 @@ class MainActivity : SimpleActivity(), DirectoryOperationsListener {
             } else if (requestCode == PICK_WALLPAPER) {
                 setResult(RESULT_OK)
                 finish()
+            } else if (requestCode == REQUEST_CODE_SPEECH_INPUT) {
+                if (resultData != null) {
+                    val res: ArrayList<String> =
+                        resultData.getStringArrayListExtra(RecognizerIntent.EXTRA_RESULTS) as ArrayList<String>
+
+                    val speechToText =  Objects.requireNonNull(res)[0]
+                    if (speechToText.isNotEmpty()) {
+                        binding.mainMenu.setText(speechToText)
+                    }
+                }
             }
         }
         super.onActivityResult(requestCode, resultCode, resultData)
@@ -404,6 +431,11 @@ class MainActivity : SimpleActivity(), DirectoryOperationsListener {
             R.menu.menu_main
         }
 
+        if (baseConfig.useSpeechToText) {
+            isSpeechToTextAvailable = isSpeechToTextAvailable()
+            binding.mainMenu.showSpeechToText = isSpeechToTextAvailable
+        }
+
         binding.mainMenu.getToolbar().inflateMenu(menuId)
         binding.mainMenu.toggleHideOnScroll(!config.scrollHorizontally && config.hideTopBarWhenScroll)
         binding.mainMenu.setupMenu()
@@ -412,6 +444,10 @@ class MainActivity : SimpleActivity(), DirectoryOperationsListener {
             if (config.searchAllFilesByDefault) {
                 launchSearchActivity()
             }
+        }
+
+        binding.mainMenu.onSpeechToTextClickListener = {
+            speechToText()
         }
 
         binding.mainMenu.onSearchTextChangedListener = { text ->
@@ -447,14 +483,17 @@ class MainActivity : SimpleActivity(), DirectoryOperationsListener {
     }
 
     private fun updateMenuColors() {
-        updateStatusbarColor(getProperBackgroundColor())
+        val useSurfaceColor = isDynamicTheme() && !isSystemInDarkMode()
+        val backgroundColor = if (useSurfaceColor) getSurfaceColor() else getProperBackgroundColor()
+        updateStatusbarColor(backgroundColor)
         binding.mainMenu.updateColors(getStartRequiredStatusBarColor(), scrollingView?.computeVerticalScrollOffset() ?: 0)
     }
 
     private fun getStartRequiredStatusBarColor(): Int {
         val scrollingViewOffset = scrollingView?.computeVerticalScrollOffset() ?: 0
         return if (scrollingViewOffset == 0) {
-            getProperBackgroundColor()
+            val useSurfaceColor = isDynamicTheme() && !isSystemInDarkMode()
+            if (useSurfaceColor) getSurfaceColor() else getProperBackgroundColor()
         } else {
             getColoredMaterialStatusBarColor()
         }
@@ -471,7 +510,7 @@ class MainActivity : SimpleActivity(), DirectoryOperationsListener {
             mStoredScrollHorizontally = scrollHorizontally
             mStoredStyleString = "$folderStyle$showFolderMediaCount$limitFolderTitle"
             mStoredHideTopBarWhenScroll = hideTopBarWhenScroll
-            tabsChanged = false
+            needRestart = false
         }
     }
 
@@ -1318,7 +1357,7 @@ class MainActivity : SimpleActivity(), DirectoryOperationsListener {
 
         mLoadedInitialPhotos = true
         if (config.appRunCount > 1) {
-            checkLastMediaChanged()
+            checkLastMediaChanged(true)
         }
 
         runOnUiThread {
@@ -1558,7 +1597,7 @@ class MainActivity : SimpleActivity(), DirectoryOperationsListener {
         }
     }
 
-    private fun checkLastMediaChanged() {
+    private fun checkLastMediaChanged(first: Boolean = false) {
         if (isDestroyed) {
             return
         }
@@ -1570,7 +1609,8 @@ class MainActivity : SimpleActivity(), DirectoryOperationsListener {
                 if (mLatestMediaId != mediaId || mLatestMediaDateId != mediaDateId) {
                     mLatestMediaId = mediaId
                     mLatestMediaDateId = mediaDateId
-                    runOnUiThread {
+                    //We do not update the adapter on first launch to avoid double loading of the adapter
+                    if (!first) runOnUiThread {
                         getDirectories()
                     }
                 } else {
@@ -1694,6 +1734,9 @@ class MainActivity : SimpleActivity(), DirectoryOperationsListener {
             add(Release(601, R.string.release_601))
             add(Release(610, R.string.release_610))
             add(Release(650, R.string.release_650))
+            add(Release(651, R.string.release_651))
+            add(Release(700, R.string.release_700))
+            add(Release(701, R.string.release_701))
             checkWhatsNew(this, BuildConfig.VERSION_CODE)
         }
     }
